@@ -164,19 +164,6 @@ export GROUNDING_DINO_TOKENIZER=/absolute/path/to/bert_base_uncased_tokenizer.js
 
 当前文本提示主流程优先且强制使用 SAM3；通常不需要配置这两个资源。
 
-## 上传 GitHub
-
-新目录已经初始化 Git，但没有替你提交或连接远程仓库：
-
-```bash
-git status
-git add .
-git status                 # 确认没有 models/sam3.pt 和 data 内容
-git commit -m "Initial SAM3 annotator release"
-git branch -M main
-git remote add origin https://github.com/YOUR_NAME/auto-obb-annotator.git
-git push -u origin main
-```
 
 ## 第三方与许可证
 
