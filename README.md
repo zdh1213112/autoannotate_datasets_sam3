@@ -40,13 +40,27 @@ SAM3 权重大小约 **3.45 GB**，而 GitHub 普通 Git 的单文件硬限制�
 `models/sam3.pt` 已加入 `.gitignore`。当前新项目文件夹中已经复制了该文件，可以本机
 直接运行，但 `git add .` 不会上传它。
 
-其他用户克隆仓库后需要自行获得合法的 SAM3 权重并放到：
+### 下载 SAM3 权重
+
+SAM3 需要手动下载核心模型权重，否则文本提示模式无法正常运行：
+
+- 模型文件：`sam3.pt`
+- ModelScope 下载地址：[facebook/sam3/sam3.pt](https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt)
+
+可以直接下载到项目的 `models/` 目录：
+
+```bash
+wget -O models/sam3.pt \
+  https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt
+```
+
+也可以使用浏览器打开上述链接下载，然后将文件放到：
 
 ```text
 models/sam3.pt
 ```
 
-也可以放在任意位置，通过环境变量指定：
+如果权重放在其他目录，可以通过绝对路径指定：
 
 ```bash
 export SAM3_MODEL_PATH=/absolute/path/to/sam3.pt
@@ -171,4 +185,3 @@ export GROUNDING_DINO_TOKENIZER=/absolute/path/to/bert_base_uncased_tokenizer.js
 Ultralytics、MobileSAM 及权重文件的上游许可证后再分发或商用。
 
 本仓库暂未添加原创代码的 `LICENSE`，发布前请根据代码权属选择合适许可证。
-
