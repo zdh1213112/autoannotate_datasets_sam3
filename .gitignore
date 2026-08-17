@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+.env
+
+.idea/
+.vscode/
+.DS_Store
+
+# User images, labels and generated datasets. Keep only placeholders.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# sam3.pt is about 3.45 GB and GitHub rejects it. Keep all extra models local.
+models/*
+!models/mobile_sam.pt
+!models/README.md
+
+dist/
+build/
+*.egg-info/
