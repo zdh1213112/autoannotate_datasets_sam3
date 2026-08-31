@@ -6,6 +6,7 @@ import numpy as np
 import shutil
 import random
 import gc
+import re
 from pathlib import Path
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSpinBox,
@@ -13,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QProgressBar, QGridLayout, QInputDialog,
                              QDialog, QSlider, QFrame, QCheckBox, QComboBox,
                              QLineEdit)
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint, QRect
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint, QRect, QSettings
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QTransform
 from ultralytics import SAM
 from ultralytics.engine.model import Model as UltralyticsModel
@@ -45,6 +46,10 @@ except Exception:
 
 
 SAM3_MODEL_PATH = str(SAM3_MODEL)
+
+# 该默认值对应固定相机画面中的灰色台面（用户示例中的红框）。坐标按图片
+# 宽高归一化，所以同一机位的不同分辨率可以共用；也可在界面中重新框选。
+DEFAULT_WORKSPACE_ROI = (0.23, 0.02, 0.74, 0.66)
 
 
 class GroundingDINOTextDetector:
@@ -1054,6 +1059,77 @@ def _bbox_intersection_area_xyxy(box_a, box_b):
     return max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
 
 
+def normalize_workspace_roi(roi):
+    """校验并规范化工作区域，格式为归一化的 (x1, y1, x2, y2)。"""
+    try:
+        valid_length = roi is not None and len(roi) == 4
+    except TypeError:
+        valid_length = False
+    if not valid_length:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(value) for value in roi]
+    except (TypeError, ValueError):
+        return None
+    x1, x2 = sorted((float(np.clip(x1, 0.0, 1.0)),
+                     float(np.clip(x2, 0.0, 1.0))))
+    y1, y2 = sorted((float(np.clip(y1, 0.0, 1.0)),
+                     float(np.clip(y2, 0.0, 1.0))))
+    if x2 - x1 < 0.01 or y2 - y1 < 0.01:
+        return None
+    return x1, y1, x2, y2
+
+
+def bbox_passes_workspace_roi(box_xyxy, img_w, img_h, roi,
+                              min_overlap=0.5):
+    """框中心须在 ROI 内，且至少一半框面积与 ROI 相交。"""
+    roi = normalize_workspace_roi(roi)
+    if roi is None:
+        return True
+    if img_w <= 0 or img_h <= 0 or box_xyxy is None or len(box_xyxy) != 4:
+        return False
+
+    x1, y1, x2, y2 = [float(value) for value in box_xyxy]
+    box = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+    box_area = _bbox_area_xyxy(box)
+    if box_area <= 0:
+        return False
+
+    rx1, ry1, rx2, ry2 = roi
+    roi_pixels = [rx1 * img_w, ry1 * img_h, rx2 * img_w, ry2 * img_h]
+    center_x, center_y = _bbox_center(box)
+    center_inside = (
+        roi_pixels[0] <= center_x <= roi_pixels[2]
+        and roi_pixels[1] <= center_y <= roi_pixels[3]
+    )
+    overlap = _bbox_intersection_area_xyxy(box, roi_pixels) / box_area
+    return center_inside and overlap >= float(min_overlap)
+
+
+def workspace_roi_text(roi):
+    roi = normalize_workspace_roi(roi)
+    if roi is None:
+        return "未设置"
+    x1, y1, x2, y2 = roi
+    return f"x={x1:.3f}~{x2:.3f}, y={y1:.3f}~{y2:.3f}"
+
+
+def draw_workspace_roi(vis_img, roi, color=(0, 0, 255), thickness=2):
+    """在诊断可视化中画出工作区域；不会改动训练图片。"""
+    roi = normalize_workspace_roi(roi)
+    if roi is None or vis_img is None:
+        return
+    img_h, img_w = vis_img.shape[:2]
+    x1, y1, x2, y2 = roi
+    cv2.rectangle(
+        vis_img,
+        (int(round(x1 * img_w)), int(round(y1 * img_h))),
+        (int(round(x2 * img_w)), int(round(y2 * img_h))),
+        color,
+        thickness,
+    )
+
+
 def _bbox_containment_ratio(inner_box, outer_box):
     inner_area = _bbox_area_xyxy(inner_box)
     if inner_area <= 0:
@@ -1527,6 +1603,14 @@ class AnnotationThread(QThread):
                 annotation_format = 'obb'
             format_name = "YOLO-HBB 普通框" if annotation_format == 'hbb' else "YOLO-OBB 旋转框"
             self.log_signal.emit(f"🏷️ 当前标签格式: {format_name}")
+            workspace_roi = normalize_workspace_roi(
+                self.config.get('workspace_roi'))
+            if workspace_roi is not None:
+                self.log_signal.emit(
+                    f"🟥 只保留灰色台面工作区域内的目标: "
+                    f"{workspace_roi_text(workspace_roi)}")
+            else:
+                self.log_signal.emit("⬜ 工作区域过滤未启用，将检测整张图片。")
             if use_point_refine:
                 self.log_signal.emit("🎯 已启用 SAM 点提示精修模式（框 + 正负点提示）。")
             self.log_signal.emit(f"🧱 SAM 分批推理已启用 (batch={sam_batch_size}, device={device})")
@@ -1650,7 +1734,10 @@ class AnnotationThread(QThread):
                 self.log_signal.emit(f"  → UI 手动覆盖阈值: {ui_thresh:.3f}")
 
             dataset_records = []
-            stats = {"total": 0, "pass": 0, "rej_bg": 0, "rej_feat": 0}
+            stats = {
+                "total": 0, "pass": 0, "rej_roi": 0,
+                "rej_bg": 0, "rej_feat": 0,
+            }
             sim_samples = []        # 所有相似度（用于最终诊断）
             rejected_vis = []       # 被拦截样本的可视化（最多保存20个）
             stage_stats = {
@@ -1681,10 +1768,28 @@ class AnnotationThread(QThread):
                 if sam3_segmenter is not None:
                     sam3_masks, sam3_boxes, sam3_scores = sam3_segmenter.detect(
                         img, text_prompt)
+                    stats["total"] += len(sam3_boxes)
+                    stage_stats['text_boxes'] += len(sam3_boxes)
+                    if workspace_roi is not None:
+                        keep_indices = [
+                            i for i, box in enumerate(sam3_boxes)
+                            if bbox_passes_workspace_roi(
+                                box, img_w, img_h, workspace_roi)
+                        ]
+                        stats["rej_roi"] += len(sam3_boxes) - len(keep_indices)
+                        score_values = sam3_scores or [1.0] * len(sam3_boxes)
+                        sam3_masks = [
+                            sam3_masks[i] for i in keep_indices
+                            if i < len(sam3_masks)
+                        ]
+                        sam3_boxes = [sam3_boxes[i] for i in keep_indices]
+                        sam3_scores = [
+                            score_values[i] for i in keep_indices
+                            if i < len(score_values)
+                        ]
                     merged_sam_prompts = [
                         [int(round(v)) for v in box] for box in sam3_boxes]
                     text_scores = sam3_scores or [1.0] * len(merged_sam_prompts)
-                    stats["total"] += len(merged_sam_prompts)
                 elif text_detector is not None:
                     text_boxes, text_scores = text_detector.detect(
                         img, text_prompt,
@@ -1701,6 +1806,15 @@ class AnnotationThread(QThread):
 
                 if sam3_segmenter is None:
                     stats["total"] += len(merged_sam_prompts)
+                    if workspace_roi is not None:
+                        prompts_before_roi = len(merged_sam_prompts)
+                        merged_sam_prompts = [
+                            box for box in merged_sam_prompts
+                            if bbox_passes_workspace_roi(
+                                box, img_w, img_h, workspace_roi)
+                        ]
+                        stats["rej_roi"] += (
+                            prompts_before_roi - len(merged_sam_prompts))
 
                 if merged_sam_prompts:
                     image_labels = []
@@ -1832,10 +1946,21 @@ class AnnotationThread(QThread):
                             })
                             stage_stats['valid_labels'] += 1
 
+                    if workspace_roi is not None:
+                        candidates_before_roi = len(img_candidates)
+                        img_candidates = [
+                            cand for cand in img_candidates
+                            if bbox_passes_workspace_roi(
+                                cand.get('bbox_xyxy'), img_w, img_h,
+                                workspace_roi)
+                        ]
+                        stats["rej_roi"] += (
+                            candidates_before_roi - len(img_candidates))
+
                     img_candidates = deduplicate_mask_candidates(img_candidates)
                     img_candidates = suppress_contained_candidates(img_candidates)
                     img_candidates = suppress_neighbor_duplicates(img_candidates)
-                    if sam3_segmenter is not None or text_detector is not None:
+                    if self.config.get('left_right_mode', False):
                         assign_left_right_classes(img_candidates, img_w)
                     else:
                         for cand in img_candidates:
@@ -1849,6 +1974,7 @@ class AnnotationThread(QThread):
                             'img_w': cand['img_w'],
                             'img_h': cand['img_h'],
                             'class_id': cand['class_id'],
+                            'left_right_mode': self.config.get('left_right_mode', False),
                         })
                         image_labels.append((cand['class_id'], cand['label']))
                         stats["pass"] += 1
@@ -1881,14 +2007,15 @@ class AnnotationThread(QThread):
 
                     if idx < self.config['num_vis']:
                         vis_img = record['img'].copy()
+                        draw_workspace_roi(vis_img, workspace_roi)
                         for _, label in record['labels']:
                             draw_yolo_label(vis_img, label, annotation_format)
                         cv2.imwrite(
                             os.path.join(out_dir, f"visualizations/vis_{record['name']}"),
                             vis_img)
 
-                class_names = ["left", "right"] if (
-                    sam3_segmenter is not None or text_detector is not None) else ["object"]
+                class_names = ["left", "right"] if self.config.get(
+                    'left_right_mode', False) else [self.config.get('class_name', 'object')]
                 write_project_dataset_yaml(out_dir, class_names)
                 yaml_path = os.path.join(out_dir, "dataset.yaml")
 
@@ -1913,6 +2040,7 @@ class AnnotationThread(QThread):
                 self.log_signal.emit("📊 =================【校验报告】=================")
                 self.log_signal.emit(f"  总计提取区域:           {stats['total']} 个")
                 self.log_signal.emit(f"  ✅ 生成标签:            {stats['pass']} 个")
+                self.log_signal.emit(f"  🟥 工作区域外拦截:      {stats['rej_roi']} 个")
                 self.log_signal.emit(f"  ❌ 背景排斥拦截:        {stats['rej_bg']} 个")
                 self.log_signal.emit(f"  ❌ 特征相似度拦截:      {stats['rej_feat']} 个")
                 self.log_signal.emit(
@@ -1943,6 +2071,9 @@ class AnnotationThread(QThread):
                     'raw_candidates': raw_candidates,
                     'out_dir': out_dir,
                     'annotation_format': annotation_format,
+                    'class_names': class_names,
+                    'left_right_mode': self.config.get('left_right_mode', False),
+                    'workspace_roi': workspace_roi,
                     'split_ratio': self.config['split_ratio'],
                     'num_vis': self.config['num_vis'],
                 })
@@ -1967,6 +2098,12 @@ class AutoAnnotatorApp(QMainWindow):
         self.templates_info = []      # list of (gray_rotated, w, h)
         self.template_patches = []    # list of BGR patch (for feature verifier)
         self._raw_records = []        # 缓存原始 SAM 结果（含相似度），供重新过滤
+        self.settings = QSettings("AutoOBBAnnotator", "AutoOBBAnnotator")
+        saved_roi = str(self.settings.value(
+            "workspace_roi", ",".join(map(str, DEFAULT_WORKSPACE_ROI))))
+        self.workspace_roi = normalize_workspace_roi(saved_roi.split(","))
+        if self.workspace_roi is None:
+            self.workspace_roi = DEFAULT_WORKSPACE_ROI
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -2067,10 +2204,18 @@ class AutoAnnotatorApp(QMainWindow):
         grid_params.addWidget(self.ed_text_prompt, 2, 1, 1, 2)
         grid_params.addWidget(self.sp_text_box_thresh, 2, 3)
 
+        self.ed_class_name = QLineEdit("object")
+        self.ed_class_name.setToolTip(
+            "其他物体的 YOLO 类别名，例如 cup、bottle、box。\n"
+            "文本提示为 hand 时会自动使用 left/right 两类。"
+        )
+        grid_params.addWidget(QLabel("类别名称:"), 3, 0)
+        grid_params.addWidget(self.ed_class_name, 3, 1, 1, 3)
+
         sim_hint = QLabel("↑ 程序会自动校准阈值（模板自相似度×75%）。若标注为0，查看日志中「相似度诊断」，将此值调到 min值 以下。")
         sim_hint.setStyleSheet("color: #FF9800; font-size: 11px;")
         sim_hint.setWordWrap(True)
-        grid_params.addWidget(sim_hint, 3, 0, 1, 4)
+        grid_params.addWidget(sim_hint, 4, 0, 1, 4)
 
         self.chk_point_refine = QCheckBox("启用 SAM 点提示精修")
         self.chk_point_refine.setChecked(False)
@@ -2080,12 +2225,32 @@ class AutoAnnotatorApp(QMainWindow):
             "默认关闭以避免每个候选框单独调用一次 SAM；需要更精细边界时再开启。\n"
             "若当前 ultralytics 版本不支持点提示，会自动回退。"
         )
-        grid_params.addWidget(self.chk_point_refine, 4, 0, 1, 2)
+        grid_params.addWidget(self.chk_point_refine, 5, 0, 1, 2)
 
         refine_hint = QLabel("建议默认开启：对细长物体、贴近背景的目标，分割边界通常更稳。")
         refine_hint.setStyleSheet("color: #4CAF50; font-size: 11px;")
         refine_hint.setWordWrap(True)
-        grid_params.addWidget(refine_hint, 4, 2, 1, 2)
+        grid_params.addWidget(refine_hint, 5, 2, 1, 2)
+
+        self.chk_workspace_roi = QCheckBox("只标注灰色台面区域")
+        self.chk_workspace_roi.setChecked(
+            self.settings.value("workspace_roi_enabled", True, type=bool))
+        self.chk_workspace_roi.setToolTip(
+            "启用后，候选框中心必须位于所选区域内，且至少一半框面积在区域内。\n"
+            "固定相机画面建议开启，可排除右侧货架等区域中的同类物体。")
+        self.chk_workspace_roi.toggled.connect(
+            lambda checked: self.settings.setValue(
+                "workspace_roi_enabled", checked))
+
+        self.btn_workspace_roi = QPushButton("🟥 重新框选台面区域")
+        self.btn_workspace_roi.clicked.connect(self.select_workspace_roi)
+        self.lbl_workspace_roi = QLabel(workspace_roi_text(self.workspace_roi))
+        self.lbl_workspace_roi.setStyleSheet("color:#EF5350;font-size:11px;")
+        self.lbl_workspace_roi.setToolTip("归一化区域坐标，不受图片分辨率变化影响。")
+
+        grid_params.addWidget(self.chk_workspace_roi, 6, 0)
+        grid_params.addWidget(self.btn_workspace_roi, 6, 1)
+        grid_params.addWidget(self.lbl_workspace_roi, 6, 2, 1, 2)
 
         group_params.setLayout(grid_params)
         layout.addWidget(group_params)
@@ -2150,6 +2315,8 @@ class AutoAnnotatorApp(QMainWindow):
             "3. 点击【一键开始自动标注】。\n\n"
             "✨ 新功能：\n"
             "  • SAM3 文本提示模式：输入 hand/cup 等英文名称，无需模板即可自动找框并分割\n"
+            "  • hand 自动按画面左右分为 left/right；其他物体使用一个可自定义类别\n"
+            "  • 灰色台面工作区域过滤：默认按示例红框过滤，也可在界面重新框选\n"
             "  • 标签格式可选 YOLO-OBB 旋转框或 YOLO-HBB 普通框\n"
             "  • ROI 8控制点拖拽调整大小，橙色手柄拖拽旋转，全部跟着框走\n"
             "  • 快捷键: Space确认, Z/V大旋转, X/C微旋转, D复制框, 方向键平移\n"
@@ -2180,6 +2347,60 @@ class AutoAnnotatorApp(QMainWindow):
         if directory:
             label_widget.setText(display_path(directory))
             label_widget.setStyleSheet("color: black;")
+
+    def select_workspace_roi(self):
+        """在输入目录第一张图上选择固定机位的有效标注区域。"""
+        input_dir = str(resolve_path(self.lbl_input.text()))
+        if not os.path.isdir(input_dir):
+            QMessageBox.warning(self, "错误", "请先选择正确的原始图片目录！")
+            return
+        image_names = sorted(
+            name for name in os.listdir(input_dir)
+            if name.lower().endswith(('.png', '.jpg', '.jpeg'))
+        )
+        if not image_names:
+            QMessageBox.warning(self, "错误", "输入目录中没有图片！")
+            return
+
+        image_path = os.path.join(input_dir, image_names[0])
+        dialog = ROISelectorDialog(
+            image_path,
+            title="只框选灰色台面区域（画框后按 Space 确认）",
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        rois = dialog.get_rois_with_angle()
+        if not rois:
+            QMessageBox.warning(
+                self, "未设置区域",
+                "没有已确认的框。请拖出矩形后按 Space，再点击完成。")
+            return
+
+        cx, cy, width, height, angle = rois[-1]
+        half_w, half_h = width / 2.0, height / 2.0
+        corners = [
+            _rot_pt_f(cx + dx, cy + dy, cx, cy, angle)
+            for dx, dy in (
+                (-half_w, -half_h), (half_w, -half_h),
+                (half_w, half_h), (-half_w, half_h),
+            )
+        ]
+        xs = [point[0] for point in corners]
+        ys = [point[1] for point in corners]
+        roi = normalize_workspace_roi((
+            min(xs) / dialog.img_w, min(ys) / dialog.img_h,
+            max(xs) / dialog.img_w, max(ys) / dialog.img_h,
+        ))
+        if roi is None:
+            QMessageBox.warning(self, "区域无效", "框选区域过小，请重新选择。")
+            return
+
+        self.workspace_roi = roi
+        self.settings.setValue("workspace_roi", ",".join(map(str, roi)))
+        self.chk_workspace_roi.setChecked(True)
+        self.lbl_workspace_roi.setText(workspace_roi_text(roi))
+        self.append_log(f"🟥 灰色台面区域已更新: {workspace_roi_text(roi)}")
 
     def append_log(self, text):
         self.log_console.append(text)
@@ -2282,6 +2503,14 @@ class AutoAnnotatorApp(QMainWindow):
             return
 
         text_prompt = self.ed_text_prompt.text().strip()
+        left_right_mode = bool(re.search(r"\bhand(s)?\b", text_prompt.lower()))
+        class_name = self.ed_class_name.text().strip() or "object"
+        if not left_right_mode and class_name == "object" and text_prompt:
+            inferred_name = re.sub(
+                r"[^a-zA-Z0-9_]+", "_", text_prompt.split(",", 1)[0]
+            ).strip("_")
+            if inferred_name:
+                class_name = inferred_name[:64]
         if not self.templates_info and not text_prompt:
             reply = QMessageBox.question(
                 self, "警告",
@@ -2306,7 +2535,13 @@ class AutoAnnotatorApp(QMainWindow):
             'use_point_refine': self.chk_point_refine.isChecked(),
             'annotation_format': self.cmb_annotation_format.currentData(),
             'text_prompt': text_prompt,
+            'class_name': class_name,
+            'left_right_mode': left_right_mode,
             'text_box_threshold': self.sp_text_box_thresh.value(),
+            'workspace_roi': (
+                self.workspace_roi if self.chk_workspace_roi.isChecked()
+                else None
+            ),
             'split_ratio': 0.8,
             'num_vis': 10
         }
@@ -2398,6 +2633,7 @@ class AutoAnnotatorApp(QMainWindow):
             if i < raw['num_vis']:
                 vis_img = cv2.imread(src_path)
                 if vis_img is not None:
+                    draw_workspace_roi(vis_img, raw.get('workspace_roi'))
                     for c in records:
                         label = c.get('label', c.get('obb'))
                         if label:
@@ -2410,8 +2646,10 @@ class AutoAnnotatorApp(QMainWindow):
         self.append_log(f"   训练集: {train_count} 张 | 验证集: {len(all_names)-train_count} 张")
         self.append_log(f"   📂 结果根目录: {os.path.abspath(out_dir)}")
         self.append_log(f"   🏷️ 标签目录: {os.path.abspath(os.path.join(out_dir, 'labels'))}")
-        class_names = ["left", "right"] if annotation_format in ('obb', 'hbb') and any(
-            int(c.get('class_id', 0)) == 1 for c in candidates) else ["object"]
+        class_names = raw.get('class_names')
+        if not class_names:
+            class_names = ["left", "right"] if raw.get(
+                'left_right_mode', False) else ["object"]
         write_project_dataset_yaml(out_dir, class_names)
 
     def stop_processing(self):
