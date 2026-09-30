@@ -145,6 +145,43 @@ CHECK_MODEL_HASH=1 python scripts/check_setup.py
 python run.py
 ```
 
+D435 条形码单目标数据集使用独立入口，包含限定区域、逐张实时预览和人工修正：
+
+```bash
+python run_barcode.py
+```
+
+使用步骤见 [`BARCODE_MODE.md`](BARCODE_MODE.md)。
+
+自行设置类别、提示词和每张目标数量的通用入口：
+
+```bash
+python run_generic.py
+```
+
+使用步骤见 [`GENERIC_MODE.md`](GENERIC_MODE.md)。
+
+灰白护具 + 黑色手指的第一视角防护手套数据，使用完整框专用入口：
+
+```bash
+python run_protective_gloves.py
+```
+
+该入口默认导出 HBB，连接分开的手指/掌面 mask、增加完整框留边，并在主窗口
+逐张实时显示标注结果。详细说明见
+[`PROTECTIVE_GLOVE_MODE.md`](PROTECTIVE_GLOVE_MODE.md)。
+原来的纯黑手套模式仍使用 `python run_black_gloves.py`，详细说明见
+[`BLACK_GLOVE_MODE.md`](BLACK_GLOVE_MODE.md)。
+
+OpenTouch 已解码图片只标注完整可见右手、并逐帧交付 `bboxes.jsonl` 时，使用独立入口：
+
+```bash
+python run_opentouch_bboxes.py
+```
+
+该入口不生成 YOLO 标签。详细规则和输出格式见
+[`OPENTOUCH_BBOX_MODE.md`](OPENTOUCH_BBOX_MODE.md)。
+
 安装为可编辑包后也可以：
 
 ```bash

@@ -1256,6 +1256,17 @@ def draw_yolo_label(vis_img, label, annotation_format, color=(0, 255, 0), thickn
     cv2.polylines(vis_img, [pts_pixel], True, color, thickness)
 
 
+def make_dataset_record(img_path, img_name, labels, img_w, img_h):
+    """Build lightweight export metadata without retaining decoded pixels."""
+    return {
+        'path': img_path,
+        'name': img_name,
+        'labels': labels,
+        'img_w': img_w,
+        'img_h': img_h,
+    }
+
+
 def assign_left_right_classes(candidates, img_w):
     """按画面左右位置给手候选分配类别：0=left，1=right。"""
     if not candidates:
@@ -1760,10 +1771,14 @@ class AnnotationThread(QThread):
                     self.progress_signal.emit(idx + 1, total_imgs)
                     continue
                 img_h, img_w = img.shape[:2]
-                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-                # 构建背景排斥掩码
-                bg_excl_mask = build_bg_exclusion_mask(img_gray, bg_images_blur)
+                # SAM3 文本分割不使用灰度图或背景排斥掩码，
+                # 避免对每帧大图做无用的 CPU 转换和内存分配。
+                img_gray = None
+                bg_excl_mask = None
+                if sam3_segmenter is None:
+                    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    bg_excl_mask = build_bg_exclusion_mask(
+                        img_gray, bg_images_blur)
 
                 if sam3_segmenter is not None:
                     sam3_masks, sam3_boxes, sam3_scores = sam3_segmenter.detect(
@@ -1980,11 +1995,10 @@ class AnnotationThread(QThread):
                         stats["pass"] += 1
 
                     if image_labels:
-                        dataset_records.append({
-                            'path': img_path, 'name': img_name,
-                            'labels': image_labels, 'img': img,
-                            'img_w': img_w, 'img_h': img_h
-                        })
+                        # 只缓存导出所需的小型元数据。原先在这里保存
+                        # ``img`` 会让内存按成功标注的帧数线性增长。
+                        dataset_records.append(make_dataset_record(
+                            img_path, img_name, image_labels, img_w, img_h))
 
                 self.progress_signal.emit(idx + 1, total_imgs)
 
@@ -1995,8 +2009,9 @@ class AnnotationThread(QThread):
 
                 for idx, record in enumerate(dataset_records):
                     subset = "train" if idx < train_count else "val"
-                    shutil.copy(record['path'],
-                                os.path.join(out_dir, f"images/{subset}", record['name']))
+                    exported_img_path = os.path.join(
+                        out_dir, f"images/{subset}", record['name'])
+                    shutil.copy(record['path'], exported_img_path)
                     txt_path = os.path.join(
                         out_dir, f"labels/{subset}",
                         f"{os.path.splitext(record['name'])[0]}.txt")
@@ -2006,13 +2021,23 @@ class AnnotationThread(QThread):
                                     " ".join([f"{p:.6f}" for p in label]) + "\n")
 
                     if idx < self.config['num_vis']:
-                        vis_img = record['img'].copy()
-                        draw_workspace_roi(vis_img, workspace_roi)
-                        for _, label in record['labels']:
-                            draw_yolo_label(vis_img, label, annotation_format)
-                        cv2.imwrite(
-                            os.path.join(out_dir, f"visualizations/vis_{record['name']}"),
-                            vis_img)
+                        # 只在需要生成少量可视化时重读图片，不在
+                        # 整个 SAM 推理阶段保留所有解码图像。
+                        vis_img = cv2.imread(exported_img_path)
+                        if vis_img is None:
+                            self.log_signal.emit(
+                                f"⚠️ 无法读取已导出图片，跳过可视化: "
+                                f"{exported_img_path}")
+                        else:
+                            draw_workspace_roi(vis_img, workspace_roi)
+                            for _, label in record['labels']:
+                                draw_yolo_label(
+                                    vis_img, label, annotation_format)
+                            cv2.imwrite(
+                                os.path.join(
+                                    out_dir,
+                                    f"visualizations/vis_{record['name']}"),
+                                vis_img)
 
                 class_names = ["left", "right"] if self.config.get(
                     'left_right_mode', False) else [self.config.get('class_name', 'object')]

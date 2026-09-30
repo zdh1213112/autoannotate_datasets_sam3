@@ -7,11 +7,13 @@ segmenter with a conservative black-glove selector.
 
 from dataclasses import dataclass
 import math
+import os
 import re
 import sys
 
 import cv2
 import numpy as np
+from PyQt5.QtCore import QCoreApplication, QLibraryInfo
 from PyQt5.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
@@ -184,6 +186,75 @@ class BlackGloveSAM3TextSegmenter(_BaseSAM3TextSegmenter):
         return select_black_gloved_hands(
             image_bgr, masks, boxes, scores, self.filter_config)
 
+    def detect_many(self, image_bgr, text_prompts):
+        """Detect several semantic classes with one shared image encoding.
+
+        SAM3 supports multiple text classes in one forward pass.  Keeping the
+        class split here avoids encoding the same frame once per prompt while
+        preserving the exact per-prompt black-glove filter used by ``detect``.
+        The return value maps every input prompt to ``(masks, boxes, scores)``.
+        """
+
+        prompts = [str(prompt) for prompt in text_prompts]
+        if not prompts:
+            return {}
+        results = base_app.UltralyticsModel.predict(
+            self.model,
+            source=image_bgr,
+            predictor=base_app.SAM3SemanticPredictor,
+            prompts={"text": prompts},
+            device=self.device,
+            conf=self.conf,
+            verbose=False,
+        )
+        empty = {prompt: ([], [], []) for prompt in prompts}
+        if not results:
+            return empty
+
+        result = results[0]
+        if result.boxes is None or len(result.boxes) == 0:
+            return empty
+        boxes = result.boxes.xyxy.detach().cpu().numpy().tolist()
+        scores = (
+            result.boxes.conf.detach().cpu().numpy().tolist()
+            if result.boxes.conf is not None
+            else [1.0] * len(boxes)
+        )
+        classes = (
+            result.boxes.cls.detach().cpu().numpy().astype(int).tolist()
+            if result.boxes.cls is not None
+            else [0] * len(boxes)
+        )
+        masks = []
+        if result.masks is not None:
+            masks = result.masks.data.detach().cpu().numpy().astype(np.uint8)
+            masks = list(masks)
+
+        output = {}
+        for class_id, prompt in enumerate(prompts):
+            indices = [
+                index
+                for index, detected_class in enumerate(classes)
+                if detected_class == class_id
+                and index < len(boxes)
+                and index < len(masks)
+            ]
+            prompt_masks = [masks[index] for index in indices]
+            prompt_boxes = [boxes[index] for index in indices]
+            prompt_scores = [scores[index] for index in indices]
+            if _HAND_PROMPT_RE.search(prompt) or _GLOVE_PROMPT_RE.search(prompt):
+                prompt_masks, prompt_boxes, prompt_scores = (
+                    select_black_gloved_hands(
+                        image_bgr,
+                        prompt_masks,
+                        prompt_boxes,
+                        prompt_scores,
+                        self.filter_config,
+                    )
+                )
+            output[prompt] = (prompt_masks, prompt_boxes, prompt_scores)
+        return output
+
 
 class BlackGloveAnnotatorApp(base_app.AutoAnnotatorApp):
     """Specialized UI that keeps the original annotator available separately."""
@@ -301,6 +372,14 @@ def main():
     # it here scopes the behavior to this dedicated launcher; run.py still uses
     # the untouched original class in a separate process.
     base_app.SAM3TextSegmenter = BlackGloveSAM3TextSegmenter
+
+    # Importing the non-headless OpenCV wheel points Qt at cv2's bundled plugin
+    # directory.  That Qt build is not ABI-compatible with PyQt5, so make sure
+    # QApplication loads PyQt5's own xcb platform plugin instead.
+    pyqt_plugin_root = QLibraryInfo.location(QLibraryInfo.PluginsPath)
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = pyqt_plugin_root
+    QCoreApplication.setLibraryPaths([pyqt_plugin_root])
+
     qt_app = QApplication(sys.argv)
     window = BlackGloveAnnotatorApp()
     window.show()
