@@ -9,24 +9,23 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 import sys
 
 import cv2
 import numpy as np
-from PyQt5.QtCore import QCoreApplication, QLibraryInfo, QObject, QThread, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QKeySequence, QPixmap
+from PyQt5.QtCore import QCoreApplication, QLibraryInfo, QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QShortcut, QSplitter, QTableWidget,
+    QProgressBar, QPushButton, QSplitter, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget, QSpinBox, QDoubleSpinBox,
-    QAbstractButton, QAbstractSpinBox,
 )
 
 from . import app as base_app
 from .app_barcode import SingleBoxDialog, _pixmap
+from .button_shortcuts import ButtonShortcuts
 from .protective_glove_core import ProtectiveGloveFilterConfig
 from .protective_glove_review_core import (
     CLASS_NAMES,
@@ -80,45 +79,6 @@ def _side_style(obj):
     if class_id == 1:
         return "right", (255, 150, 0)
     return "unknown (1=L / 2=R)", (0, 210, 255)
-
-
-class ButtonShortcuts(QObject):
-    """Bind the key shown on each button to its normal enabled click action."""
-
-    def __init__(self, window):
-        super().__init__(window)
-        self.window = window
-        self.bindings = []
-        for button in window.findChildren(QAbstractButton):
-            if button.window() is not window:
-                continue
-            match = re.search(r"\[([^\]]+)\]$", button.text())
-            if match is None:
-                continue
-            key = match.group(1)
-            shortcut = QShortcut(QKeySequence(key), window)
-            shortcut.setContext(Qt.WindowShortcut)
-            shortcut.setAutoRepeat(False)
-            shortcut.activated.connect(button.click)
-            button.setToolTip(button.toolTip() or f"快捷键：{key}")
-            button.setAutoRepeat(False)
-            if isinstance(button, QPushButton):
-                # Enter must not trigger whichever dialog button last had focus.
-                button.setAutoDefault(False)
-            self.bindings.append((shortcut, key))
-        QApplication.instance().focusChanged.connect(self.update)
-        self.update(None, QApplication.focusWidget())
-
-    def update(self, _old, current):
-        modal = QApplication.activeModalWidget()
-        in_this_window = current is not None and current.window() is self.window
-        typing = in_this_window and isinstance(
-            current, (QLineEdit, QAbstractSpinBox, QComboBox))
-        for shortcut, key in self.bindings:
-            # Function keys and modified shortcuts remain usable in path fields.
-            text_key = len(key) == 1 or key in {"Space", "Delete", "Enter"}
-            shortcut.setEnabled((modal is None or modal is self.window)
-                                and not (typing and text_key))
 
 
 class GloveBoxDialog(SingleBoxDialog):

@@ -7,17 +7,73 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import shutil
 
 import cv2
 import numpy as np
 
-from .barcode_core import polygon_in_roi, roi_pixels
+from .generic_region import (
+    crop_region, polygon_in_region, region_bounds, region_near_edge,
+)
 
 
 AUTO_SCORE = 0.70
-EXTRA_SCORE = 0.45
 NMS_IOU = 0.70
+REVIEW_RULES = (
+    ("missing", "未检测到目标"),
+    ("short_count", "固定数量不足"),
+    ("class_conflict", "同位置类别冲突"),
+    ("near_edge", "目标贴近区域边缘"),
+    ("low_score", "低置信度目标"),
+)
+DEFAULT_REVIEW_REASONS = tuple(key for key, _ in REVIEW_RULES)
+DEFAULT_SELECTION_RULE = "confidence"
+SELECTION_RULES = ("confidence", "area")
+
+
+def normalize_sample_percent(percent=None) -> int:
+    if percent is None:
+        return 100
+    if isinstance(percent, bool) or not isinstance(percent, int) or not 1 <= percent <= 100:
+        raise ValueError("自动标注图片比例必须是 1% 到 100% 的整数")
+    return percent
+
+
+def normalize_sample_seed(seed: int) -> int:
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError("随机抽样种子无效")
+    return seed
+
+
+def sample_image_files(files: list[Path], percent: int, seed: int) -> list[Path]:
+    """Pick a seeded random subset of the current image list."""
+    percent = normalize_sample_percent(percent)
+    seed = normalize_sample_seed(seed)
+    ordered = sorted(files, key=lambda path: path.name)
+    count = (len(ordered) * percent + 99) // 100
+    if count == len(ordered):
+        return ordered
+    return random.Random(seed).sample(ordered, count)
+
+
+def normalize_selection_rule(rule=None) -> str:
+    if rule is None:
+        return DEFAULT_SELECTION_RULE
+    if rule not in SELECTION_RULES:
+        raise ValueError(f"未知标签框选择方式: {rule}")
+    return rule
+
+
+def normalize_review_reasons(reasons=None) -> list[str]:
+    if reasons is None:
+        return list(DEFAULT_REVIEW_REASONS)
+    if not isinstance(reasons, (list, tuple, set)):
+        raise ValueError("待复核原因配置无效")
+    unknown = set(reasons) - set(DEFAULT_REVIEW_REASONS)
+    if unknown:
+        raise ValueError(f"未知待复核原因: {', '.join(sorted(unknown))}")
+    return [key for key in DEFAULT_REVIEW_REASONS if key in reasons]
 
 
 def validate_classes(classes: list[dict]) -> list[dict]:
@@ -81,14 +137,17 @@ def _polygon_iou(first, second) -> float:
 
 
 def select_detections(image, roi, detections: list[dict], class_count: int,
-                      count_mode: str, target_count: int) -> dict:
-    """Normalize polygons, remove duplicate boxes, and apply the count policy."""
+                      count_mode: str, target_count: int,
+                      review_reasons=None, selection_rule=None) -> dict:
+    """Keep every in-region prediction and select deduplicated output labels."""
     if count_mode not in {"all", "fixed"}:
         raise ValueError(f"未知目标数量模式: {count_mode}")
     if count_mode == "fixed" and target_count < 1:
         raise ValueError("固定目标数至少为 1")
+    selection_rule = normalize_selection_rule(selection_rule)
+    enabled_reasons = set(normalize_review_reasons(review_reasons))
     height, width = image.shape[:2]
-    x1, y1, x2, y2 = roi_pixels(roi, width, height)
+    x1, y1, x2, y2 = region_bounds(roi, width, height)
     crop_height, crop_width = y2 - y1, x2 - x1
     candidates = []
     for detection in detections:
@@ -101,64 +160,102 @@ def select_detections(image, roi, detections: list[dict], class_count: int,
         if polygon is None:
             continue
         polygon += np.array([x1, y1], dtype=np.float32)
-        if not polygon_in_roi(polygon, roi, width, height):
+        if not polygon_in_region(polygon, roi, width, height):
             continue
         candidates.append({"class_id": class_id, "score": score,
                            "polygon": polygon})
     candidates.sort(key=lambda item: item["score"], reverse=True)
 
+    # Keep candidate IDs in confidence order for the preview, while choosing
+    # an NMS representative according to the selected fixed-count rule.
+    ranked = list(enumerate(candidates))
+    if count_mode == "fixed" and selection_rule == "area":
+        ranked.sort(key=lambda pair: (cv2.contourArea(pair[1]["polygon"]),
+                                       pair[1]["score"]), reverse=True)
     unique = []
     ambiguous_class = False
-    for candidate in candidates:
-        duplicate = next((kept for kept in unique
+    for index, candidate in ranked:
+        duplicate = next((kept for _, kept in unique
                           if _polygon_iou(candidate["polygon"], kept["polygon"]) >= NMS_IOU),
                          None)
         if duplicate is not None:
             if (candidate["class_id"] != duplicate["class_id"] and
-                    duplicate["score"] - candidate["score"] < 0.15):
+                    abs(duplicate["score"] - candidate["score"]) < 0.15):
                 ambiguous_class = True
             continue
-        unique.append(candidate)
+        unique.append((index, candidate))
 
     chosen = unique[:target_count] if count_mode == "fixed" else unique
+    chosen_ids = {index for index, _ in chosen}
     objects = [{"class_id": item["class_id"],
                 "score": round(item["score"], 4),
-                "polygon": item["polygon"].round(2).tolist()}
-               for item in chosen]
-    near_edge = any(
-        np.any(item["polygon"][:, 0] <= x1 + 2) or
-        np.any(item["polygon"][:, 0] >= x2 - 3) or
-        np.any(item["polygon"][:, 1] <= y1 + 2) or
-        np.any(item["polygon"][:, 1] >= y2 - 3)
-        for item in chosen
-    )
+                "polygon": item["polygon"].round(2).tolist(),
+                "candidate_id": index}
+               for index, item in chosen]
+    visible_candidates = [
+        {"class_id": item["class_id"], "score": round(item["score"], 4),
+         "polygon": item["polygon"].round(2).tolist(),
+         "selected": index in chosen_ids}
+        for index, item in enumerate(candidates)
+    ]
+    near_edge = any(region_near_edge(item["polygon"], roi, width, height)
+                    for _, item in chosen)
+    triggered = []
     if not objects:
-        reason = "区域内未找到目标，请人工补框或确认无目标"
-    elif count_mode == "fixed" and len(objects) < target_count:
-        reason = f"只找到 {len(objects)} 个目标，少于设定的 {target_count} 个"
-    elif count_mode == "fixed" and any(
-            item["score"] >= EXTRA_SCORE for item in unique[target_count:]):
-        reason = "高分候选超过设定数量，请人工选择"
-    elif ambiguous_class:
-        reason = "同一位置匹配多个类别，请人工核对类别"
-    elif near_edge:
-        reason = "目标贴近标注区域边缘，请人工检查"
-    elif any(item["score"] < AUTO_SCORE for item in chosen):
-        reason = "存在低置信度目标，请人工检查"
+        triggered.append(("missing", "区域内未找到目标，请人工补框或确认无目标"))
+    if count_mode == "fixed" and len(objects) < target_count:
+        triggered.append(("short_count", f"只找到 {len(objects)} 个目标，少于设定的 {target_count} 个"))
+    if ambiguous_class:
+        triggered.append(("class_conflict", "同一位置匹配多个类别，请人工核对类别"))
+    if near_edge:
+        triggered.append(("near_edge", "目标贴近标注区域边缘，请人工检查"))
+    if any(item["score"] < AUTO_SCORE for _, item in chosen):
+        triggered.append(("low_score", "存在低置信度目标，请人工检查"))
+    selected = next((text for key, text in triggered if key in enabled_reasons), None)
+    if selected:
+        status, reason = "review", selected
+    elif triggered:
+        status, reason = "auto", f"{triggered[0][1]}（该复核条件已关闭）"
     else:
-        reason = "自动候选，可人工复核"
-    status = "auto" if reason == "自动候选，可人工复核" else "review"
-    return {"objects": objects, "status": status, "reason": reason,
-            "candidate_count": len(unique)}
+        status, reason = "auto", "自动候选，可人工复核"
+    return {"objects": objects, "candidates": visible_candidates,
+            "status": status, "reason": reason,
+            "candidate_count": len(visible_candidates)}
+
+
+def sync_candidates(record: dict) -> dict:
+    """Match selected objects to display candidates after manual editing."""
+    candidates = [dict(item) for item in record.get("candidates", [])]
+    objects = []
+    selected_ids = set()
+    for source in record.get("objects", []):
+        obj = dict(source)
+        candidate_id = obj.get("candidate_id")
+        if (not isinstance(candidate_id, int) or isinstance(candidate_id, bool)
+                or candidate_id < 0 or candidate_id >= len(candidates)
+                or candidate_id in selected_ids):
+            candidate_id = len(candidates)
+            obj["candidate_id"] = candidate_id
+            candidates.append({})
+        selected_ids.add(candidate_id)
+        candidates[candidate_id].update(
+            class_id=obj["class_id"], score=obj.get("score", 1.0),
+            polygon=obj["polygon"], selected=True)
+        objects.append(obj)
+    for index, item in enumerate(candidates):
+        item["selected"] = index in selected_ids
+    return {**record, "objects": objects, "candidates": candidates,
+            "candidate_count": max(int(record.get("candidate_count", 0)), len(candidates))}
 
 
 def detect_generic(image, roi, segmenter, classes: list[dict],
-                   count_mode: str, target_count: int) -> dict:
-    x1, y1, x2, y2 = roi_pixels(roi, image.shape[1], image.shape[0])
+                   count_mode: str, target_count: int,
+                   review_reasons=None, selection_rule=None) -> dict:
     detections = segmenter.detect_many(
-        image[y1:y2, x1:x2], [item["prompt"] for item in classes])
+        crop_region(image, roi), [item["prompt"] for item in classes])
     return select_detections(image, roi, detections, len(classes),
-                             count_mode, target_count)
+                             count_mode, target_count, review_reasons,
+                             selection_rule)
 
 
 def yolo_row(obj: dict, width: int, height: int, box_format: str,
@@ -185,10 +282,12 @@ def yolo_row(obj: dict, width: int, height: int, box_format: str,
 
 
 def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
-                   classes: list[dict], box_format: str) -> tuple[Path, int, int]:
+                   classes: list[dict], box_format: str,
+                   allowed_names: set[str] | None = None) -> tuple[Path, int, int]:
     classes = validate_classes(classes)
     selected = [record for record in records.values()
-                if record["status"] in {"auto", "confirmed", "empty_confirmed"}]
+                if record["status"] in {"auto", "confirmed", "empty_confirmed"}
+                and (allowed_names is None or record["name"] in allowed_names)]
     if len(selected) < 2:
         raise ValueError("至少需要 2 张可导出的图片，才能建立训练集和验证集")
     selected.sort(key=lambda item: (hashlib.sha256(item["name"].encode()).hexdigest(),

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import shutil
+from datetime import datetime
 from pathlib import Path
 import sys
+import tempfile
 
 import cv2
 import numpy as np
@@ -20,19 +24,38 @@ from PyQt5.QtWidgets import (
 
 from .app import SAM3SemanticPredictor, SAM3TextSegmenter, UltralyticsModel, torch
 from .app_barcode import SingleBoxDialog
-from .barcode_core import (
-    append_record, image_files, load_records, normalize_roi, polygon_in_roi,
-    roi_pixels,
+from .barcode_core import append_record, image_files, load_records
+from .button_shortcuts import ButtonShortcuts
+from .generic_core import (
+    REVIEW_RULES, detect_generic, export_generic, normalize_review_reasons,
+    normalize_sample_percent, normalize_sample_seed, normalize_selection_rule,
+    sample_image_files,
+    sync_candidates, validate_classes,
 )
-from .generic_core import detect_generic, export_generic, validate_classes
+from .generic_region import (
+    FULL_REGION, circle_pixels, normalize_region, polygon_in_region, region_bounds,
+)
+from .generic_region_dialog import GenericRegionDialog
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
 DEFAULT_OUTPUT = ROOT_DIR / "data" / "generic_annotations"
 STATUS_TEXT = {"auto": "自动候选", "review": "待人工复核",
-               "confirmed": "人工确认", "empty_confirmed": "人工确认无目标"}
-COLORS = [(0, 210, 0), (0, 190, 255), (255, 180, 0), (220, 0, 200),
-          (100, 220, 220), (170, 80, 255)]
+               "confirmed": "人工确认", "empty_confirmed": "人工确认无目标",
+               "unlabeled": "待重新检测", "skipped": "未抽中"}
+SELECTED_COLOR = (0, 200, 0)  # BGR
+UNSELECTED_COLOR = (11, 134, 184)  # dark goldenrod, BGR
+
+
+class ClickablePreview(QLabel):
+    clicked = pyqtSignal(object)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(event.pos())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 def _pixmap(image_bgr) -> QPixmap:
@@ -40,6 +63,71 @@ def _pixmap(image_bgr) -> QPixmap:
     height, width = rgb.shape[:2]
     return QPixmap.fromImage(QImage(rgb.data, width, height, width * 3,
                                     QImage.Format_RGB888).copy())
+
+
+def replace_review_records(path: Path, records: dict[str, dict]) -> None:
+    """Atomically replace effective records when clearing a whole image directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=".review_", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            for record in sorted(records.values(), key=lambda item: item["name"]):
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def replace_project_config(path: Path, config: dict) -> None:
+    """Commit a changed project configuration without a partially written JSON file."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=".project_", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(config, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def backup_project(output: Path) -> Path:
+    """Preserve the previous configuration and labels before reprocessing."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = output / f"backup_before_config_{stamp}"
+    suffix = 2
+    while backup.exists():
+        backup = output / f"backup_before_config_{stamp}_{suffix}"
+        suffix += 1
+    backup.mkdir()
+    shutil.copy2(output / "project.json", backup / "project.json")
+    review_path = output / "review.jsonl"
+    if review_path.exists():
+        shutil.copy2(review_path, backup / "review.jsonl")
+    return backup
+
+
+class GenericBoxDialog(SingleBoxDialog):
+    """Add the review shortcuts to the existing rotated-box editor."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        labels = {"清除框": "清除框 [Ctrl+Backspace]",
+                  "保存这个框": "保存这个框 [Ctrl+S]", "取消": "取消 [Esc]"}
+        for button in self.findChildren(QPushButton):
+            button.setText(labels[button.text()])
+        self.button_shortcuts = ButtonShortcuts(self)
+        self.canvas.setFocus()
 
 
 class GenericSAM3Segmenter(SAM3TextSegmenter):
@@ -72,11 +160,13 @@ class GenericThread(QThread):
     progress_signal = pyqtSignal(int, int)
     message_signal = pyqtSignal(str)
 
-    def __init__(self, files: list[Path], config: dict, done_names: set[str]):
+    def __init__(self, files: list[Path], config: dict, done_names: set[str],
+                 segmenter=None):
         super().__init__()
         self.files = files
         self.config = config
         self.done_names = done_names
+        self.segmenter = segmenter
         self.running = True
 
     def stop(self):
@@ -92,10 +182,14 @@ class GenericThread(QThread):
                 self.message_signal.emit("所有图片已有检测结果；可继续人工复核或导出。")
                 return
             device = "cuda:0" if torch is not None and torch.cuda.is_available() else "cpu"
-            self.message_signal.emit(f"正在加载 SAM3（{device}），本次检测 {len(todo)} 张...")
-            segmenter = GenericSAM3Segmenter(
-                model_path=str(SAM3_MODEL), device=device,
-                conf=self.config["confidence"])
+            if self.segmenter is None or self.segmenter.device != device:
+                self.message_signal.emit(f"正在加载 SAM3（{device}），本次检测 {len(todo)} 张...")
+                self.segmenter = GenericSAM3Segmenter(
+                    model_path=str(SAM3_MODEL), device=device,
+                    conf=self.config["confidence"])
+            else:
+                self.segmenter.conf = float(self.config["confidence"])
+                self.message_signal.emit(f"复用已加载的 SAM3（{device}），本次检测 {len(todo)} 张...")
             for path in todo:
                 if not self.running:
                     break
@@ -104,14 +198,16 @@ class GenericThread(QThread):
                     if image is None:
                         raise ValueError("图片无法解码")
                     result = detect_generic(
-                        image, self.config["roi"], segmenter,
+                        image, self.config["roi"], self.segmenter,
                         self.config["classes"], self.config["count_mode"],
                         self.config["target_count"],
+                        self.config.get("review_reasons"),
+                        self.config.get("selection_rule"),
                     )
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])
                 except Exception as exc:
-                    result = {"name": path.name, "objects": [],
+                    result = {"name": path.name, "objects": [], "candidates": [],
                               "status": "review", "reason": f"检测失败: {exc}",
                               "candidate_count": 0}
                 self.result_signal.emit(result)
@@ -127,7 +223,7 @@ class GenericAnnotatorApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("通用 SAM3 标注与人工复核")
         self.resize(1500, 960)
-        self.roi = [0.0, 0.0, 1.0, 1.0]
+        self.roi = FULL_REGION.copy()
         self.records: dict[str, dict] = {}
         self.row_for_name: dict[str, int] = {}
         self.current_name = None
@@ -135,6 +231,9 @@ class GenericAnnotatorApp(QMainWindow):
         self.active_output = None
         self.active_config = None
         self.thread = None
+        self.segmenter = None
+        self.sample_seed = secrets.randbits(64)
+        self._deleted_during_run = set()
         self.preview_pixmap = None
         self._loading_objects = False
         self.config_locked = False
@@ -149,20 +248,20 @@ class GenericAnnotatorApp(QMainWindow):
         self.output_edit = QLineEdit(str(DEFAULT_OUTPUT))
         self.output_edit.editingFinished.connect(self.load_project)
         self.path_buttons = []
-        for row, (label, edit, chooser) in enumerate((
-            ("图片目录", self.input_edit, self.choose_input),
-            ("结果目录", self.output_edit, self.choose_output),
+        for row, (label, edit, chooser, shortcut) in enumerate((
+            ("图片目录", self.input_edit, self.choose_input, "Alt+I"),
+            ("结果目录", self.output_edit, self.choose_output, "Alt+O"),
         )):
-            button = QPushButton("浏览")
+            button = QPushButton(f"浏览 [{shortcut}]")
             button.clicked.connect(chooser)
             self.path_buttons.append(button)
             grid.addWidget(QLabel(label), row, 0)
             grid.addWidget(edit, row, 1, 1, 3)
             grid.addWidget(button, row, 4)
         self.roi_label = QLabel()
-        self.roi_button = QPushButton("在样图上框选区域")
+        self.roi_button = QPushButton("在样图上选择区域 [Alt+R]")
         self.roi_button.clicked.connect(self.choose_roi)
-        self.full_button = QPushButton("使用整张图片")
+        self.full_button = QPushButton("使用整张图片 [Alt+F]")
         self.full_button.clicked.connect(self.use_full_image)
         grid.addWidget(self.roi_label, 2, 0, 1, 3)
         grid.addWidget(self.roi_button, 2, 3)
@@ -174,9 +273,9 @@ class GenericAnnotatorApp(QMainWindow):
         self.class_table.setMaximumHeight(135)
         self.class_table.setItem(0, 0, QTableWidgetItem("object"))
         self.class_table.setItem(0, 1, QTableWidgetItem("object"))
-        add_class = QPushButton("添加类别")
+        add_class = QPushButton("添加类别 [Ctrl+Shift+A]")
         add_class.clicked.connect(self.add_class)
-        remove_class = QPushButton("删除选中类别")
+        remove_class = QPushButton("删除选中类别 [Ctrl+Shift+Delete]")
         remove_class.clicked.connect(self.remove_class)
         self.class_buttons = [add_class, remove_class]
         grid.addWidget(QLabel("类别与提示词"), 3, 0)
@@ -187,7 +286,7 @@ class GenericAnnotatorApp(QMainWindow):
         self.count_combo = QComboBox()
         self.count_combo.addItem("保留全部检测目标", "all")
         self.count_combo.addItem("每张期望固定数量", "fixed")
-        self.count_combo.setToolTip("固定数量按所有类别合计；不足或有额外高分候选会进入待复核。")
+        self.count_combo.setToolTip("固定数量按所有类别合计；标签框按下方选择方式确定。数量不足是否待复核由勾选项决定。")
         self.count_combo.currentIndexChanged.connect(self.update_count_ui)
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 100)
@@ -204,20 +303,49 @@ class GenericAnnotatorApp(QMainWindow):
         grid.addWidget(self.count_spin, 4, 2)
         grid.addWidget(QLabel("最低检测置信度"), 4, 3)
         grid.addWidget(self.confidence_spin, 4, 4)
+        self.selection_combo = QComboBox()
+        self.selection_combo.addItem("置信度最高的期望固定数量", "confidence")
+        self.selection_combo.addItem("框面积最大的期望固定数量", "area")
+        self.selection_combo.setToolTip("仅在固定数量模式下生效；面积按预测框的实际像素面积计算。")
+        self.selection_combo.setEnabled(False)
+        grid.addWidget(QLabel("已选标签框判断方式"), 5, 0)
+        grid.addWidget(self.selection_combo, 5, 1, 1, 4)
+        grid.addWidget(QLabel("待人工复核条件"), 6, 0)
+        reasons_row = QHBoxLayout()
+        self.review_reason_checks = {}
+        for key, label in REVIEW_RULES:
+            check = QCheckBox(label)
+            check.setChecked(True)
+            check.setToolTip("执行前取消勾选后，该条件不再使图片进入待人工复核。")
+            self.review_reason_checks[key] = check
+            reasons_row.addWidget(check)
+        grid.addLayout(reasons_row, 6, 1, 1, 4)
+        self.sample_percent_spin = QSpinBox()
+        self.sample_percent_spin.setRange(1, 100)
+        self.sample_percent_spin.setValue(100)
+        self.sample_percent_spin.setSuffix("%")
+        self.sample_percent_spin.setToolTip(
+            "从目录随机抽取指定比例的图片；至少抽取 1 张。本次随机抽样会保存，续跑仍使用同一批图片。")
+        self.sample_summary = QLabel("选择图片目录后显示预计抽取数量")
+        self.sample_percent_spin.valueChanged.connect(self.update_sample_summary)
+        self.input_edit.editingFinished.connect(self.update_sample_summary)
+        grid.addWidget(QLabel("自动标注图片比例"), 7, 0)
+        grid.addWidget(self.sample_percent_spin, 7, 1)
+        grid.addWidget(self.sample_summary, 7, 2, 1, 3)
         outer.addWidget(settings)
 
         controls = QHBoxLayout()
-        self.start_button = QPushButton("开始/继续自动检测")
+        self.start_button = QPushButton("开始/继续自动检测 [F5]")
         self.start_button.clicked.connect(self.start_detection)
-        self.stop_button = QPushButton("停止")
+        self.stop_button = QPushButton("停止 [Esc]")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_detection)
-        self.follow_check = QCheckBox("实时跟随每张结果")
+        self.follow_check = QCheckBox("实时跟随每张结果 [F]")
         self.follow_check.setChecked(True)
         self.format_combo = QComboBox()
         self.format_combo.addItem("YOLO-OBB 旋转框", "obb")
         self.format_combo.addItem("YOLO-HBB 普通框", "hbb")
-        self.export_button = QPushButton("导出训练数据集")
+        self.export_button = QPushButton("导出训练数据集 [Ctrl+E]")
         self.export_button.clicked.connect(self.export)
         for widget in (self.start_button, self.stop_button, self.follow_check,
                        self.format_combo, self.export_button):
@@ -238,11 +366,14 @@ class GenericAnnotatorApp(QMainWindow):
         self.table.itemSelectionChanged.connect(self.select_table_row)
         left_layout.addWidget(self.table)
         filter_row = QHBoxLayout()
-        self.review_filter = QCheckBox("只看待复核")
+        self.review_filter = QCheckBox("只看待复核/待重检 [R]")
         self.review_filter.toggled.connect(self.apply_filter)
-        next_button = QPushButton("下一张待复核")
+        previous_button = QPushButton("上一张待复核 [Shift+D]")
+        previous_button.clicked.connect(self.previous_review)
+        next_button = QPushButton("下一张待复核 [D]")
         next_button.clicked.connect(self.next_review)
         filter_row.addWidget(self.review_filter)
+        filter_row.addWidget(previous_button)
         filter_row.addWidget(next_button)
         left_layout.addLayout(filter_row)
         splitter.addWidget(left)
@@ -251,11 +382,13 @@ class GenericAnnotatorApp(QMainWindow):
         right_layout = QVBoxLayout(right)
         self.preview_title = QLabel("检测开始后，这里会逐张显示标注结果")
         self.preview_title.setWordWrap(True)
-        self.preview = QLabel("等待图片")
+        self.preview = ClickablePreview("等待图片")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(650, 340)
         self.preview.setStyleSheet("background:#202020;color:white;")
+        self.preview.clicked.connect(self.preview_clicked)
         right_layout.addWidget(self.preview_title)
+        right_layout.addWidget(QLabel("绿色：输出标签框；暗黄色：未选检测框。点击框可切换，框旁显示类别和置信度。"))
         right_layout.addWidget(self.preview, 1)
 
         self.object_table = QTableWidget(0, 3)
@@ -268,23 +401,36 @@ class GenericAnnotatorApp(QMainWindow):
         edit_row = QHBoxLayout()
         self.object_class_combo = QComboBox()
         self.object_class_combo.currentIndexChanged.connect(self.change_object_class)
-        add_object = QPushButton("添加框")
+        add_object = QPushButton("添加框 [A]")
         add_object.clicked.connect(self.add_object)
-        edit_object = QPushButton("修改选中框")
+        edit_object = QPushButton("修改选中框 [E]")
         edit_object.clicked.connect(self.edit_object)
-        delete_object = QPushButton("删除选中框")
+        delete_object = QPushButton("删除选中框 [Delete]")
         delete_object.clicked.connect(self.delete_object)
         for widget in (self.object_class_combo, add_object, edit_object, delete_object):
             edit_row.addWidget(widget)
         right_layout.addLayout(edit_row)
         review_row = QHBoxLayout()
-        confirm_button = QPushButton("确认本张所有框")
+        confirm_button = QPushButton("确认并下一张待复核 [Space]")
         confirm_button.clicked.connect(self.confirm_current)
-        empty_button = QPushButton("确认本张无目标")
+        previous_image_button = QPushButton("上一张 [Shift+N]")
+        previous_image_button.clicked.connect(self.show_previous_image)
+        next_image_button = QPushButton("下一张 [N]")
+        next_image_button.clicked.connect(self.show_next_image)
+        empty_button = QPushButton("确认本张无目标 [Q]")
         empty_button.clicked.connect(self.mark_empty)
+        clear_labels_button = QPushButton("删除本张标签并待重检 [Ctrl+Delete]")
+        clear_labels_button.clicked.connect(self.clear_current_labels)
         review_row.addWidget(confirm_button)
+        review_row.addWidget(previous_image_button)
+        review_row.addWidget(next_image_button)
         review_row.addWidget(empty_button)
+        review_row.addWidget(clear_labels_button)
         right_layout.addLayout(review_row)
+        self.clear_all_button = QPushButton("删除目录全部标签并待重检 [Ctrl+Shift+R]")
+        self.clear_all_button.clicked.connect(self.clear_all_labels)
+        self.clear_all_button.setStyleSheet("color:#b71c1c;")
+        right_layout.addWidget(self.clear_all_button, alignment=Qt.AlignRight)
         splitter.addWidget(right)
         splitter.setSizes([430, 1070])
         outer.addWidget(splitter, 1)
@@ -295,6 +441,8 @@ class GenericAnnotatorApp(QMainWindow):
         outer.addWidget(self.status)
         self.show_roi()
         self.load_project()
+        self.button_shortcuts = ButtonShortcuts(self, (self.class_table,))
+        self.table.setFocus()
 
     def source_dir(self) -> Path:
         value = self.input_edit.text().strip()
@@ -350,14 +498,17 @@ class GenericAnnotatorApp(QMainWindow):
         self._loading_objects = False
 
     def update_count_ui(self):
-        self.count_spin.setEnabled(
-            not self.config_locked and self.count_combo.currentData() == "fixed")
+        fixed = not self.config_locked and self.count_combo.currentData() == "fixed"
+        self.count_spin.setEnabled(fixed)
+        self.selection_combo.setEnabled(fixed)
 
     def set_config_controls(self, enabled: bool):
         self.config_locked = not enabled
         for widget in (self.input_edit, self.roi_button, self.full_button,
                        self.class_table, self.count_combo, self.confidence_spin,
-                       self.path_buttons[0], *self.class_buttons):
+                       self.sample_percent_spin,
+                       self.path_buttons[0], *self.class_buttons,
+                       *self.review_reason_checks.values()):
             widget.setEnabled(enabled)
         self.update_count_ui()
 
@@ -366,8 +517,9 @@ class GenericAnnotatorApp(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择图片目录", start)
         if path:
             self.input_edit.setText(path)
-            self.roi = [0.0, 0.0, 1.0, 1.0]
+            self.roi = FULL_REGION.copy()
             self.show_roi()
+            self.update_sample_summary()
 
     def choose_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择结果目录", str(self.output_dir()))
@@ -387,40 +539,55 @@ class GenericAnnotatorApp(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法框选", str(exc))
             return
-        x1, y1, x2, y2 = roi_pixels(self.roi, image.shape[1], image.shape[0])
-        initial = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-        dialog = SingleBoxDialog(files[0], "框选本项目的检测区域", initial,
-                                 roi_mode=True, parent=self)
+        dialog = GenericRegionDialog(files[0], self.roi, parent=self)
         if dialog.exec_() == QDialog.Accepted:
-            points = np.asarray(dialog.result_polygon)
-            self.roi = normalize_roi([
-                points[:, 0].min() / image.shape[1],
-                points[:, 1].min() / image.shape[0],
-                points[:, 0].max() / image.shape[1],
-                points[:, 1].max() / image.shape[0],
-            ])
+            self.roi = dialog.result_region
             self.show_roi()
 
     def use_full_image(self):
-        self.roi = [0.0, 0.0, 1.0, 1.0]
+        self.roi = FULL_REGION.copy()
         self.show_roi()
 
     def show_roi(self):
-        if self.roi == [0.0, 0.0, 1.0, 1.0]:
+        if self.roi == FULL_REGION:
             self.roi_label.setText("检测区域：整张图片")
+        elif isinstance(self.roi, dict):
+            cx, cy = self.roi["center"]
+            self.roi_label.setText(
+                f"检测区域：圆形（中心 {cx:.3f}, {cy:.3f}；半径 {self.roi['radius']:.3f} × 短边）")
         else:
-            self.roi_label.setText("检测区域比例：" + ", ".join(f"{value:.3f}" for value in self.roi))
+            self.roi_label.setText("检测区域：矩形（" + ", ".join(
+                f"{value:.3f}" for value in self.roi) + "）")
+
+    def update_sample_summary(self):
+        try:
+            files = image_files(self.source_dir())
+            count = len(sample_image_files(files, self.sample_percent_spin.value(),
+                                           self.sample_seed))
+        except (OSError, ValueError):
+            self.sample_summary.setText("选择图片目录后显示预计抽取数量")
+            return
+        self.sample_summary.setText(
+            f"预计随机抽取 {count}/{len(files)} 张")
 
     def config(self) -> dict:
         source = self.source_dir()
         return {"source_dir": str(source), "roi": self.roi,
                 "classes": self.classes(), "count_mode": self.count_combo.currentData(),
                 "target_count": self.count_spin.value(),
-                "confidence": self.confidence_spin.value()}
+                "selection_rule": normalize_selection_rule(
+                    self.selection_combo.currentData()),
+                "sample_percent": normalize_sample_percent(
+                    self.sample_percent_spin.value()),
+                "sample_seed": normalize_sample_seed(self.sample_seed),
+                "confidence": self.confidence_spin.value(),
+                "review_reasons": [key for key, check in self.review_reason_checks.items()
+                                   if check.isChecked()]}
 
     def load_project(self):
         path = self.output_dir() / "project.json"
         if not path.exists():
+            self.sample_seed = secrets.randbits(64)
             self.active_source = None
             self.active_output = None
             self.active_config = None
@@ -434,14 +601,30 @@ class GenericAnnotatorApp(QMainWindow):
         try:
             config = json.loads(path.read_text(encoding="utf-8"))
             self.input_edit.setText(config["source_dir"])
-            self.roi = normalize_roi(config["roi"])
+            self.roi = normalize_region(config["roi"])
             if self.roi is None:
                 raise ValueError("项目中的检测区域无效")
+            reasons = normalize_review_reasons(config.get("review_reasons"))
+            config["review_reasons"] = reasons
+            config["selection_rule"] = normalize_selection_rule(
+                config.get("selection_rule"))
+            config["sample_percent"] = normalize_sample_percent(
+                config.get("sample_percent"))
+            self.sample_seed = normalize_sample_seed(
+                config["sample_seed"] if "sample_seed" in config
+                else secrets.randbits(64))
+            config["sample_seed"] = self.sample_seed
+            for key, check in self.review_reason_checks.items():
+                check.setChecked(key in reasons)
             self.show_roi()
             self.set_classes(validate_classes(config["classes"]))
             self.count_combo.setCurrentIndex(
                 self.count_combo.findData(config["count_mode"]))
             self.count_spin.setValue(int(config["target_count"]))
+            self.selection_combo.setCurrentIndex(
+                self.selection_combo.findData(config["selection_rule"]))
+            self.sample_percent_spin.setValue(config["sample_percent"])
+            self.update_sample_summary()
             self.confidence_spin.setValue(float(config["confidence"]))
             self.active_source = Path(config["source_dir"])
             self.active_output = self.output_dir()
@@ -454,11 +637,11 @@ class GenericAnnotatorApp(QMainWindow):
             for record in sorted(self.records.values(), key=lambda item: item["name"]):
                 self.update_table(record)
             self.update_counts()
-            self.set_config_controls(False)
+            self.set_config_controls(True)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.status.setText(f"读取旧项目失败: {exc}")
 
-    def ensure_project(self) -> dict:
+    def ensure_project(self, allow_reconfigure: bool = False) -> dict:
         config = self.config()
         source, output = self.source_dir(), self.output_dir()
         if not source.is_dir():
@@ -468,15 +651,56 @@ class GenericAnnotatorApp(QMainWindow):
         path = output / "project.json"
         if path.exists():
             previous = json.loads(path.read_text(encoding="utf-8"))
-            if previous != config:
-                raise ValueError("该结果目录已有其他类别、数量、区域或图片源；请换一个新结果目录")
-            self.records = load_records(output / "review.jsonl")
+            previous["roi"] = normalize_region(previous.get("roi"))
+            previous["review_reasons"] = normalize_review_reasons(
+                previous.get("review_reasons"))
+            previous["selection_rule"] = normalize_selection_rule(
+                previous.get("selection_rule"))
+            previous["sample_percent"] = normalize_sample_percent(
+                previous.get("sample_percent"))
+            missing_seed = "sample_seed" not in previous
+            previous["sample_seed"] = normalize_sample_seed(
+                previous.get("sample_seed", config["sample_seed"]))
+            needs_random_migration = missing_seed and previous["sample_percent"] < 100
+            if previous != config or needs_random_migration:
+                if not allow_reconfigure:
+                    raise ValueError("配置已修改，请先按 F5 根据新配置重新检测，再导出。")
+                if previous["sample_percent"] != config["sample_percent"]:
+                    config["sample_seed"] = secrets.randbits(64)
+                files = image_files(source)
+                if not files:
+                    raise ValueError("图片目录为空，无法按新配置继续检测")
+                backup = backup_project(output)
+                updated = {
+                    image.name: {"name": image.name, "objects": [], "candidates": [],
+                                 "candidate_count": 0, "status": "unlabeled",
+                                 "reason": "项目配置已更新，等待重新自动检测"}
+                    for image in files
+                }
+                review_path = output / "review.jsonl"
+                try:
+                    replace_review_records(review_path, updated)
+                    replace_project_config(path, config)
+                except OSError:
+                    old_review = backup / "review.jsonl"
+                    if old_review.exists():
+                        shutil.copy2(old_review, review_path)
+                    else:
+                        review_path.unlink(missing_ok=True)
+                    raise
+                self.records = updated
+                self.sample_seed = config["sample_seed"]
+                self.current_name = None
+                self.clear_preview()
+            else:
+                if missing_seed:
+                    replace_project_config(path, config)
+                self.records = load_records(output / "review.jsonl")
         else:
             if (output / "review.jsonl").exists():
                 raise ValueError("结果目录有 review.jsonl 但缺少 project.json，请换目录")
             output.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(config, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
+            replace_project_config(path, config)
             self.records = {}
         if self.active_output != output:
             self.current_name = None
@@ -487,17 +711,59 @@ class GenericAnnotatorApp(QMainWindow):
         self.active_output = output
         self.active_config = config
         self.refresh_object_classes()
-        self.set_config_controls(False)
+        self.set_config_controls(not (self.thread and self.thread.isRunning()))
         return config
+
+    def apply_sampling(self, files: list[Path], sampled: list[Path], percent: int):
+        """Persist exclusions so resume and review display the same image selection."""
+        selected_names = {path.name for path in sampled}
+        updated = dict(self.records)
+        changed = False
+        dropped_results = False
+        for path in files:
+            previous = updated.get(path.name)
+            if path.name in selected_names:
+                if previous is not None and previous.get("status") == "skipped":
+                    updated[path.name] = {
+                        "name": path.name, "objects": [], "candidates": [],
+                        "candidate_count": 0, "status": "unlabeled",
+                        "reason": "已纳入抽样，等待自动检测",
+                    }
+                    changed = True
+            elif previous is None or previous.get("status") != "skipped":
+                if previous is not None and previous.get("status") not in {"unlabeled", "skipped"}:
+                    dropped_results = True
+                updated[path.name] = {
+                    "name": path.name, "objects": [], "candidates": [],
+                    "candidate_count": 0, "status": "skipped",
+                    "reason": f"未抽中：自动标注图片比例 {percent}%",
+                }
+                changed = True
+        if changed:
+            if dropped_results:
+                backup_project(self.active_output)
+            replace_review_records(self.active_output / "review.jsonl", updated)
+            self.records = updated
+
+    def validate_model_ready(self):
+        if self.segmenter is None and not SAM3_MODEL.is_file():
+            raise FileNotFoundError(f"找不到 SAM3 模型: {SAM3_MODEL}")
+
+    def make_detection_thread(self, files, config, done_names):
+        return GenericThread(files, config, done_names, self.segmenter)
 
     def start_detection(self):
         try:
-            config = self.ensure_project()
+            self.config()
             files = image_files(self.source_dir())
             if not files:
                 raise ValueError("图片目录为空")
-            if not SAM3_MODEL.is_file():
-                raise FileNotFoundError(f"找不到 SAM3 模型: {SAM3_MODEL}")
+            self.validate_model_ready()
+            config = self.ensure_project(allow_reconfigure=True)
+            sampled = sample_image_files(files, config["sample_percent"],
+                                         config["sample_seed"])
+            self.apply_sampling(files, sampled, config["sample_percent"])
+            self.update_sample_summary()
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法开始", str(exc))
             return
@@ -505,7 +771,15 @@ class GenericAnnotatorApp(QMainWindow):
         self.row_for_name.clear()
         for record in sorted(self.records.values(), key=lambda item: item["name"]):
             self.update_table(record)
-        self.thread = GenericThread(files, config, set(self.records))
+        # Keep manual decisions, and retry images without labels or held by the old rule.
+        done_names = {
+            name for name, record in self.records.items()
+            if record.get("status") in {"confirmed", "empty_confirmed"} or
+            (record.get("objects") and "candidates" in record and
+             record.get("reason") != "高分候选超过设定数量，请人工选择")
+        }
+        self._deleted_during_run.clear()
+        self.thread = self.make_detection_thread(sampled, config, done_names)
         self.thread.result_signal.connect(self.receive_result)
         self.thread.progress_signal.connect(self.update_progress)
         self.thread.message_signal.connect(self.status.setText)
@@ -515,6 +789,7 @@ class GenericAnnotatorApp(QMainWindow):
         self.export_button.setEnabled(False)
         self.output_edit.setEnabled(False)
         self.path_buttons[1].setEnabled(False)
+        self.set_config_controls(False)
         self.thread.start()
 
     def stop_detection(self):
@@ -523,16 +798,23 @@ class GenericAnnotatorApp(QMainWindow):
             self.status.setText("正在停止；当前图片完成后退出。")
 
     def detection_finished(self):
+        if self.thread.segmenter is not None:
+            self.segmenter = self.thread.segmenter
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.export_button.setEnabled(True)
         self.output_edit.setEnabled(True)
         self.path_buttons[1].setEnabled(True)
-        self.set_config_controls(False)
+        self.set_config_controls(True)
         self.update_counts()
         self.thread = None
 
     def receive_result(self, record):
+        if record["name"] in self._deleted_during_run:
+            return
+        if self.records.get(record["name"], {}).get("status") in {
+                "confirmed", "empty_confirmed"}:
+            return
         append_record(self.active_output / "review.jsonl", record)
         self.records[record["name"]] = record
         self.update_table(record)
@@ -541,6 +823,8 @@ class GenericAnnotatorApp(QMainWindow):
             self.table.blockSignals(True)
             self.table.selectRow(self.row_for_name[record["name"]])
             self.table.blockSignals(False)
+            self.show_record(record["name"])
+        elif record["name"] == self.current_name:
             self.show_record(record["name"])
 
     def update_progress(self, done, total):
@@ -560,18 +844,20 @@ class GenericAnnotatorApp(QMainWindow):
                   record.get("reason", "")]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
-            if column == 1 and record["status"] == "review":
+            if column == 1 and record["status"] in {"review", "unlabeled"}:
                 item.setForeground(QColor("#bf5b00"))
+            elif column == 1 and record["status"] == "skipped":
+                item.setForeground(QColor("#777777"))
             self.table.setItem(row, column, item)
         self.table.setRowHidden(row, self.review_filter.isChecked() and
-                                record["status"] != "review")
+                                record["status"] not in {"review", "unlabeled"})
 
     def apply_filter(self):
         if self.review_filter.isChecked():
             self.follow_check.setChecked(False)
         for name, row in self.row_for_name.items():
             self.table.setRowHidden(row, self.review_filter.isChecked() and
-                                    self.records[name]["status"] != "review")
+                                    self.records[name]["status"] not in {"review", "unlabeled"})
 
     def select_table_row(self):
         row = self.table.currentRow()
@@ -586,25 +872,34 @@ class GenericAnnotatorApp(QMainWindow):
         record = self.records.get(name)
         if record is None:
             return
+        display_record = sync_candidates(record)
         self.current_name = name
         image = cv2.imread(str(self.active_source / name))
         if image is None:
             self.preview.setText("无法读取图片")
             return
-        x1, y1, x2, y2 = roi_pixels(self.roi, image.shape[1], image.shape[0])
-        cv2.rectangle(image, (x1, y1), (x2 - 1, y2 - 1), (30, 30, 230), 2)
+        if isinstance(self.roi, dict):
+            cx, cy, radius = circle_pixels(self.roi, image.shape[1], image.shape[0])
+            cv2.circle(image, (round(cx), round(cy)), round(radius), (30, 30, 230), 2)
+        else:
+            x1, y1, x2, y2 = region_bounds(self.roi, image.shape[1], image.shape[0])
+            cv2.rectangle(image, (x1, y1), (x2 - 1, y2 - 1), (30, 30, 230), 2)
         self._loading_objects = True
         self.object_table.setRowCount(0)
         captions = []
-        for index, obj in enumerate(record.get("objects", [])):
-            class_id = int(obj["class_id"])
-            color = COLORS[class_id % len(COLORS)]
-            points = np.rint(obj["polygon"]).astype(np.int32)
+        for candidate in sorted(display_record["candidates"],
+                                key=lambda item: bool(item["selected"])):
+            class_id = int(candidate["class_id"])
+            color = SELECTED_COLOR if candidate["selected"] else UNSELECTED_COLOR
+            points = np.rint(candidate["polygon"]).astype(np.int32)
             cv2.polylines(image, [points], True, color, 3)
             label = self.active_config["classes"][class_id]["name"]
             anchor = points.min(axis=0)
             captions.append((max(2, int(anchor[0])), max(24, int(anchor[1]) - 5),
-                             f"{index + 1}: {label}", color))
+                             f"{label} {float(candidate.get('score', 0)):.2f}", color))
+        for index, obj in enumerate(record.get("objects", [])):
+            class_id = int(obj["class_id"])
+            label = self.active_config["classes"][class_id]["name"]
             self.object_table.insertRow(index)
             for column, text in enumerate((str(index + 1), label,
                                            f"{obj.get('score', 0):.2f}")):
@@ -622,9 +917,49 @@ class GenericAnnotatorApp(QMainWindow):
         self.refresh_preview()
         self.preview_title.setText(
             f"{name}  |  {STATUS_TEXT.get(record['status'], record['status'])}  |  "
-            f"已选 {len(record.get('objects', []))} / 候选 {record.get('candidate_count', 0)}  |  "
+            f"已选 {len(record.get('objects', []))} / 候选 {len(display_record['candidates'])}  |  "
             f"{record.get('reason', '')}"
         )
+
+    def preview_clicked(self, position):
+        if self.current_name is None or self.preview_pixmap is None:
+            return
+        shown = self.preview.pixmap()
+        if shown is None or shown.isNull():
+            return
+        offset_x = (self.preview.width() - shown.width()) / 2
+        offset_y = (self.preview.height() - shown.height()) / 2
+        if not (offset_x <= position.x() < offset_x + shown.width() and
+                offset_y <= position.y() < offset_y + shown.height()):
+            return
+        x = (position.x() - offset_x) * self.preview_pixmap.width() / shown.width()
+        y = (position.y() - offset_y) * self.preview_pixmap.height() / shown.height()
+        self.toggle_candidate_at(x, y)
+
+    def toggle_candidate_at(self, x, y):
+        record = sync_candidates(self.records[self.current_name])
+        hits = []
+        for index, candidate in enumerate(record["candidates"]):
+            polygon = np.asarray(candidate["polygon"], dtype=np.float32)
+            if (polygon.shape == (4, 2) and
+                    cv2.pointPolygonTest(polygon, (float(x), float(y)), False) >= 0):
+                hits.append((not candidate["selected"], cv2.contourArea(polygon), index))
+        if not hits:
+            return
+        _, _, candidate_id = min(hits)
+        candidate = record["candidates"][candidate_id]
+        objects = [obj for obj in record["objects"]
+                   if obj["candidate_id"] != candidate_id]
+        if not candidate["selected"]:
+            objects.append({"class_id": candidate["class_id"],
+                            "score": candidate.get("score", 1.0),
+                            "polygon": candidate["polygon"],
+                            "candidate_id": candidate_id})
+        self.follow_check.setChecked(False)
+        self.save_review({**record, "objects": objects,
+                          "status": "confirmed" if objects else "review",
+                          "reason": "人工选择检测框" if objects else
+                                    "已取消全部标签框，请选择目标或确认无目标"})
 
     def clear_preview(self):
         self.preview_pixmap = None
@@ -657,14 +992,27 @@ class GenericAnnotatorApp(QMainWindow):
         if self.current_name is None or self.current_name not in self.records:
             QMessageBox.information(self, "先选图片", "请在左侧选一张图片。")
             return None
-        return self.records[self.current_name]
+        record = self.records[self.current_name]
+        if record["status"] == "skipped":
+            QMessageBox.information(
+                self, "图片未抽中",
+                "这张图片未被当前比例抽中，不会检测或导出。"
+                "如需标注它，请提高自动标注图片比例后按 F5；设为 100% 可包含全部图片。")
+            return None
+        return record
 
     def save_review(self, record):
-        append_record(self.active_output / "review.jsonl", record)
+        record = sync_candidates(record)
+        try:
+            append_record(self.active_output / "review.jsonl", record)
+        except OSError as exc:
+            QMessageBox.warning(self, "保存失败", f"当前结果未保存：{exc}")
+            return False
         self.records[record["name"]] = record
         self.update_table(record)
         self.show_record(record["name"])
         self.update_counts()
+        return True
 
     def add_object(self):
         record = self.current_record()
@@ -672,11 +1020,11 @@ class GenericAnnotatorApp(QMainWindow):
             return
         self.follow_check.setChecked(False)
         path = self.active_source / record["name"]
-        dialog = SingleBoxDialog(path, f"添加目标：{record['name']}", parent=self)
+        dialog = GenericBoxDialog(path, f"添加目标：{record['name']}", parent=self)
         if dialog.exec_() != QDialog.Accepted:
             return
         image = cv2.imread(str(path))
-        if not polygon_in_roi(dialog.result_polygon, self.roi, image.shape[1], image.shape[0]):
+        if not polygon_in_region(dialog.result_polygon, self.roi, image.shape[1], image.shape[0]):
             QMessageBox.warning(self, "框超出区域", "目标框中心须在区域内，且至少一半面积位于区域内。")
             return
         objects = list(record.get("objects", []))
@@ -697,12 +1045,12 @@ class GenericAnnotatorApp(QMainWindow):
             return
         self.follow_check.setChecked(False)
         path = self.active_source / record["name"]
-        dialog = SingleBoxDialog(path, f"修正目标 {index + 1}：{record['name']}",
+        dialog = GenericBoxDialog(path, f"修正目标 {index + 1}：{record['name']}",
                                  objects[index]["polygon"], parent=self)
         if dialog.exec_() != QDialog.Accepted:
             return
         image = cv2.imread(str(path))
-        if not polygon_in_roi(dialog.result_polygon, self.roi, image.shape[1], image.shape[0]):
+        if not polygon_in_region(dialog.result_polygon, self.roi, image.shape[1], image.shape[0]):
             QMessageBox.warning(self, "框超出区域", "目标框中心须在区域内，且至少一半面积位于区域内。")
             return
         objects[index] = {**objects[index], "polygon": dialog.result_polygon,
@@ -747,10 +1095,14 @@ class GenericAnnotatorApp(QMainWindow):
         if record is None:
             return
         self.follow_check.setChecked(False)
+        if record["status"] == "empty_confirmed":
+            self.next_review()
+            return
         if not record.get("objects"):
             QMessageBox.information(self, "尚无目标", "请先补画目标框，或确认本张无目标。")
             return
-        self.save_review({**record, "status": "confirmed", "reason": "人工确认所有目标"})
+        if self.save_review({**record, "status": "confirmed", "reason": "人工确认所有目标"}):
+            self.next_review()
 
     def mark_empty(self):
         record = self.current_record()
@@ -759,45 +1111,155 @@ class GenericAnnotatorApp(QMainWindow):
             self.save_review({**record, "objects": [], "status": "empty_confirmed",
                               "reason": "人工确认区域内无目标"})
 
-    def next_review(self):
+    def clear_current_labels(self):
+        """Persist an empty pending record so the current image can be detected again."""
+        record = self.current_record()
+        if record is None:
+            return
+        self.follow_check.setChecked(False)
+        cleared = {**record, "objects": [], "candidates": [], "candidate_count": 0,
+                   "status": "unlabeled", "reason": "标签已删除，等待重新自动检测"}
+        if self.save_review(cleared):
+            self._deleted_during_run.add(record["name"])
+            self.stop_detection()
+            self.status.setText(f"{record['name']} 的标签已清空并保存；按 F5 重新自动检测。")
+
+    def clear_all_labels(self):
+        """Clear every image in the active source directory and queue redetection."""
+        try:
+            files = image_files(self.source_dir())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法读取图片目录", str(exc))
+            return
+        if not files:
+            QMessageBox.information(self, "没有图片", "当前图片目录中没有可处理的图片。")
+            return
+        answer = QMessageBox.question(
+            self, "确认清空目录标签",
+            f"将清空当前项目图片目录中 {len(files)} 张图片的全部标签，"
+            "并标记为待重新检测。确认继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        names = {path.name for path in files}
+        try:
+            self.ensure_project(allow_reconfigure=True)
+            updated = dict(self.records)
+            for path in files:
+                updated[path.name] = {
+                    **updated.get(path.name, {}), "name": path.name,
+                    "objects": [], "candidates": [],
+                    "candidate_count": 0, "status": "unlabeled",
+                    "reason": "目录标签已批量删除，等待重新自动检测",
+                }
+            replace_review_records(self.active_output / "review.jsonl", updated)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "清空失败", f"目录标签未全部清空：{exc}")
+            return
+        self.stop_detection()
+        self._deleted_during_run.update(names)
+        self.follow_check.setChecked(False)
+        self.records = updated
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.row_for_name.clear()
+        for record in sorted(updated.values(), key=lambda item: item["name"]):
+            self.update_table(record)
+        name = self.current_name if self.current_name in names else files[0].name
+        self.table.selectRow(self.row_for_name[name])
+        self.table.blockSignals(False)
+        self.show_record(name)
+        self.update_counts()
+        self.status.setText(
+            f"已清空当前图片目录中 {len(files)} 张图片的标签；按 F5 重新自动检测。")
+
+    def _move_review(self, direction: int):
+        self.follow_check.setChecked(False)
         if not self.row_for_name:
+            self.status.setText("还没有可查看的图片。")
             return
         count = self.table.rowCount()
-        start = self.row_for_name.get(self.current_name, -1)
+        start = self.row_for_name.get(self.current_name,
+                                      -1 if direction > 0 else 0)
         for offset in range(1, count + 1):
-            row = (start + offset) % count
+            row = (start + direction * offset) % count
+            if self.table.isRowHidden(row):
+                continue
             name = self.table.item(row, 0).text()
             if self.records[name]["status"] == "review":
+                self.table.blockSignals(True)
                 self.table.selectRow(row)
+                self.table.scrollToItem(self.table.item(row, 0))
+                self.table.blockSignals(False)
                 self.show_record(name)
                 return
-        self.status.setText("没有待复核图片。")
+        self.status.setText("当前没有待复核图片，已保存的确认结果可导出。")
+
+    def next_review(self):
+        self._move_review(1)
+
+    def previous_review(self):
+        self._move_review(-1)
+
+    def _move_image(self, direction: int):
+        if not self.row_for_name:
+            self.status.setText("还没有可查看的图片。")
+            return
+        start = self.row_for_name.get(
+            self.current_name, -1 if direction > 0 else self.table.rowCount())
+        end = self.table.rowCount() if direction > 0 else -1
+        for row in range(start + direction, end, direction):
+            if self.table.isRowHidden(row):
+                continue
+            self.follow_check.setChecked(False)
+            self.table.blockSignals(True)
+            self.table.selectRow(row)
+            self.table.scrollToItem(self.table.item(row, 0))
+            self.table.blockSignals(False)
+            self.show_record(self.table.item(row, 0).text())
+            return
+        self.status.setText("已经是最后一张图片。" if direction > 0
+                            else "已经是第一张图片。")
+
+    def show_next_image(self):
+        self._move_image(1)
+
+    def show_previous_image(self):
+        self._move_image(-1)
 
     def update_counts(self):
         counts = {status: 0 for status in STATUS_TEXT}
         for record in self.records.values():
             counts[record["status"]] = counts.get(record["status"], 0) + 1
         self.status.setText(
-            f"已处理 {len(self.records)} 张；自动候选 {counts['auto']}，"
+            f"共记录 {len(self.records)} 张；自动候选 {counts['auto']}，"
             f"待复核 {counts['review']}，人工确认 {counts['confirmed']}，"
-            f"确认无目标 {counts['empty_confirmed']}。"
+            f"确认无目标 {counts['empty_confirmed']}，待重检 {counts['unlabeled']}，"
+            f"未抽中 {counts['skipped']}。"
         )
 
     def export(self):
         try:
             config = self.ensure_project()
+            allowed_names = {path.name for path in sample_image_files(
+                image_files(self.active_source), config["sample_percent"],
+                config["sample_seed"])}
             target, images, objects = export_generic(
                 self.active_source, self.active_output, self.records,
-                config["classes"], self.format_combo.currentData())
+                config["classes"], self.format_combo.currentData(), allowed_names)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
             return
-        unresolved = sum(record["status"] == "review" for record in self.records.values())
+        unresolved = sum(record["status"] in {"review", "unlabeled"}
+                         for record in self.records.values())
+        skipped = len(image_files(self.active_source)) - len(allowed_names)
         self.status.setText(
             f"已导出 {images} 张有目标图片、{objects} 个目标；"
-            f"{unresolved} 张待复核未导出。目录：{target}"
+            f"{unresolved} 张待复核/待重检、{skipped} 张未抽中未导出。目录：{target}"
         )
-        QMessageBox.information(self, "导出完成", f"数据集：{target}\n待复核未导出：{unresolved} 张")
+        QMessageBox.information(self, "导出完成",
+                                f"数据集：{target}\n待复核/待重检未导出：{unresolved} 张"
+                                f"\n未抽中未导出：{skipped} 张")
 
     def closeEvent(self, event):
         if self.thread:
