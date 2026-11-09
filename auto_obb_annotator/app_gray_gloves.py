@@ -20,7 +20,10 @@ from PyQt5.QtWidgets import (
 )
 
 from .app import torch
-from .app_generic import GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread
+from .app_generic import (
+    GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread,
+    SELECTED_COLOR, UNSELECTED_COLOR,
+)
 from .generic_core import detect_generic
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
 from .gray_glove_mcap import CAMERA_TOPICS
@@ -43,6 +46,8 @@ GRAY_GLOVE_PROMPTS = (
     "hand wearing a gray protective work glove",
     "hand wearing a protective work glove",
 )
+LEFT_LABEL_COLOR = SELECTED_COLOR
+RIGHT_LABEL_COLOR = (255, 180, 0)  # cyan blue in BGR
 WORKFLOW = "gray_glove_lr_v2"
 
 
@@ -280,9 +285,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.setWindowTitle("灰色手套 · 视频抽帧 / SAM3 标注 / 人工复核")
         self.output_edit.setText(str(DEFAULT_OUTPUT))
         self.set_classes(GRAY_GLOVE_CLASSES)
-        self.class_table.setHorizontalHeaderLabels(["导出类别", "SAM3 提示词"])
+        self.class_table.setHorizontalHeaderLabels(["导出类别", "历史提示词"])
+        self.class_table.setColumnHidden(1, True)
         self.class_table.setToolTip(
-            "固定输出 left/right 两类；模型检索这三条手套提示词：\n" +
+            "固定输出 left/right 两类；左/右提示词不参与检测。"
+            "模型实际检索这三条不区分左右的手套提示词：\n" +
             "\n".join(GRAY_GLOVE_PROMPTS))
         self.settings_group = self.centralWidget().layout().itemAt(0).widget()
         self.side_combo = QComboBox()
@@ -290,8 +297,12 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.side_combo.addItem("镜像：画面左侧=right，右侧=left", "mirror")
         self.side_combo.setToolTip("双手自动分配类别的规则；单手须人工指定。")
         settings_grid = self.settings_group.layout()
+        settings_grid.itemAtPosition(3, 0).widget().setText("导出类别")
         settings_grid.addWidget(QLabel("左右手类别规则"), 8, 0)
         settings_grid.addWidget(self.side_combo, 8, 1, 1, 4)
+        settings_grid.addWidget(QLabel(
+            "SAM3 只定位灰色手套；left/right 按画面位置建议，单手和侧视图需人工确认。"),
+            9, 0, 1, 5)
         self.roi = DEFAULT_ROI.copy()
         self.show_roi()
         self.count_combo.setCurrentIndex(self.count_combo.findData("fixed"))
@@ -301,6 +312,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.review_reason_checks["class_conflict"].setChecked(False)
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
+        self.preview_legend.setText(
+            "绿色：left 标签；青蓝色：right 标签；暗黄色：未选检测框。点击框可切换，框旁显示类别和置信度。")
 
         self.video_group = QGroupBox("视频 / MCAP 抽帧：可添加录像或文件夹，完成后直接载入标注")
         video_layout = QVBoxLayout(self.video_group)
@@ -628,6 +641,12 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def clear_all_labels(self):
         super().clear_all_labels()
         self.apply_filter()
+
+    def color_for_candidate(self, candidate: dict) -> tuple[int, int, int]:
+        if not candidate["selected"]:
+            return UNSELECTED_COLOR
+        return (RIGHT_LABEL_COLOR if int(candidate["class_id"]) == 1
+                else LEFT_LABEL_COLOR)
 
     def show_record(self, name):
         super().show_record(name)

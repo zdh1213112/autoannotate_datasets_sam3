@@ -388,7 +388,9 @@ class GenericAnnotatorApp(QMainWindow):
         self.preview.setStyleSheet("background:#202020;color:white;")
         self.preview.clicked.connect(self.preview_clicked)
         right_layout.addWidget(self.preview_title)
-        right_layout.addWidget(QLabel("绿色：输出标签框；暗黄色：未选检测框。点击框可切换，框旁显示类别和置信度。"))
+        self.preview_legend = QLabel(
+            "绿色：输出标签框；暗黄色：未选检测框。点击框可切换，框旁显示类别和置信度。")
+        right_layout.addWidget(self.preview_legend)
         right_layout.addWidget(self.preview, 1)
 
         self.object_table = QTableWidget(0, 3)
@@ -868,6 +870,9 @@ class GenericAnnotatorApp(QMainWindow):
             self.follow_check.setChecked(False)
             self.show_record(name)
 
+    def color_for_candidate(self, candidate: dict) -> tuple[int, int, int]:
+        return SELECTED_COLOR if candidate["selected"] else UNSELECTED_COLOR
+
     def show_record(self, name):
         record = self.records.get(name)
         if record is None:
@@ -890,7 +895,7 @@ class GenericAnnotatorApp(QMainWindow):
         for candidate in sorted(display_record["candidates"],
                                 key=lambda item: bool(item["selected"])):
             class_id = int(candidate["class_id"])
-            color = SELECTED_COLOR if candidate["selected"] else UNSELECTED_COLOR
+            color = self.color_for_candidate(candidate)
             points = np.rint(candidate["polygon"]).astype(np.int32)
             cv2.polylines(image, [points], True, color, 3)
             label = self.active_config["classes"][class_id]["name"]

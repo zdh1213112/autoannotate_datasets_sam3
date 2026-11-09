@@ -333,6 +333,45 @@ class GrayGloveUITests(unittest.TestCase):
         self.window.toggle_focus_view()
         self.assertTrue(self.window.settings_group.isVisible())
 
+    def test_left_right_label_colors_and_side_swap(self):
+        source = self.root / "images"
+        source.mkdir()
+        cv2.imwrite(str(source / "both.jpg"), np.zeros((120, 220, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        polygons = (
+            [[20, 60], [50, 60], [50, 90], [20, 90]],
+            [[120, 60], [150, 60], [150, 90], [120, 90]],
+            [[170, 60], [200, 60], [200, 90], [170, 90]],
+        )
+        record = {
+            "name": "both.jpg", "status": "auto", "reason": "自动候选",
+            "width": 220, "height": 120,
+            "objects": [
+                {"class_id": 0, "score": 0.95, "polygon": polygons[0], "candidate_id": 0},
+                {"class_id": 1, "score": 0.94, "polygon": polygons[1], "candidate_id": 1},
+            ],
+            "candidates": [
+                {"class_id": 0, "score": 0.95, "polygon": polygons[0], "selected": True},
+                {"class_id": 1, "score": 0.94, "polygon": polygons[1], "selected": True},
+                {"class_id": 1, "score": 0.70, "polygon": polygons[2], "selected": False},
+            ],
+            "candidate_count": 3,
+        }
+        self.window.records["both.jpg"] = record
+        self.window.show_record("both.jpg")
+
+        def pixel(x):
+            return self.window.preview_pixmap.toImage().pixelColor(x, 75).getRgb()[:3]
+
+        self.assertEqual(pixel(20), (0, 200, 0))
+        self.assertEqual(pixel(120), (0, 180, 255))
+        self.assertEqual(pixel(170), (184, 134, 11))
+        self.window.swap_current_sides()
+        self.assertEqual(pixel(20), (0, 180, 255))
+        self.assertEqual(pixel(120), (0, 200, 0))
+        self.assertEqual(pixel(170), (184, 134, 11))
+
     def test_export_yaml_has_left_right_classes(self):
         source = self.root / "images"
         source.mkdir()
