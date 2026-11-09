@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -384,6 +384,124 @@ class GrayGloveUITests(unittest.TestCase):
         saved = load_records(self.output / "review.jsonl")
         self.assertEqual(saved["manual.jpg"], records[0])
         self.assertEqual(saved["empty.jpg"], records[1])
+
+    def test_review_only_recheck_preserves_other_records_and_shows_all(self):
+        source = self.root / "images"
+        source.mkdir()
+        states = {"review_a.jpg": "review", "review_b.jpg": "review",
+                  "auto.jpg": "auto", "manual.jpg": "confirmed",
+                  "empty.jpg": "empty_confirmed", "skipped.jpg": "skipped",
+                  "unlabeled.jpg": "unlabeled"}
+        for name in states:
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        path = self.output / "project.json"
+        legacy = json.loads(path.read_text())
+        legacy.pop("glove_selection_version")
+        legacy.update(confidence=0.20, selection_rule="area", sample_percent=1)
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        original = {}
+        for name, status in states.items():
+            original[name] = {"name": name, "status": status, "objects": [],
+                              "candidates": [], "candidate_count": 0,
+                              "reason": "原始记录"}
+            append_record(self.output / "review.jsonl", original[name])
+        self.window.load_project()
+        self.window.search_edit.setText("review")
+        self.window.review_filter.setChecked(True)
+        self.window.follow_check.setChecked(False)
+        thread = MagicMock()
+        thread.isRunning.return_value = False
+        thread.running = True
+        thread.segmenter = None
+        with patch.object(self.window, "validate_model_ready"), \
+                patch.object(self.window, "make_detection_thread", return_value=thread) as make:
+            self.window.recheck_review_images()
+        self.assertEqual([item.name for item in make.call_args.args[0]],
+                         ["review_a.jpg", "review_b.jpg"])
+        self.assertEqual(make.call_args.args[2], set())
+        self.assertEqual(self.window.table.rowCount(), len(states))
+        self.assertEqual(self.window.visible_count.text(), "显示 7/7 张")
+        self.assertFalse(self.window.recheck_review_button.isEnabled())
+        self.assertEqual(load_records(self.output / "review.jsonl"), original)
+        backup = next(self.output.glob("backup_before_config_*"))
+        self.assertEqual(load_records(backup / "review.jsonl"), original)
+        self.assertEqual(json.loads((backup / "project.json").read_text()), legacy)
+        self.assertEqual(json.loads(path.read_text())["selection_rule"], "confidence")
+        self.window.receive_result({**original["review_a.jpg"], "status": "auto",
+                                    "reason": "重新检测"})
+        self.window.receive_result({**original["review_b.jpg"], "reason": "检测失败: 解码错误"})
+        self.window.receive_result({**original["auto.jpg"], "status": "review"})
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["review_a.jpg"]["status"], "auto")
+        for name in states.keys() - {"review_a.jpg"}:
+            self.assertEqual(saved[name], original[name])
+        self.window.detection_finished()
+        self.assertTrue(self.window.recheck_review_button.isEnabled())
+        self.assertIn("1 张重检失败", self.window.status.text())
+
+    def test_review_only_recheck_rejects_changed_source_and_missing_files(self):
+        source = self.root / "images"
+        source.mkdir()
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        append_record(self.output / "review.jsonl", {
+            "name": "missing.jpg", "status": "review", "objects": []})
+        self.window.load_project()
+        with patch.object(ui.QMessageBox, "warning") as warning, \
+                patch.object(self.window, "make_detection_thread") as make:
+            self.window.recheck_review_images()
+            self.assertIn("图片不存在", warning.call_args.args[2])
+            other = self.root / "other"
+            other.mkdir()
+            self.window.input_edit.setText(str(other))
+            self.window.recheck_review_images()
+            self.assertIn("图片目录与已保存项目不一致", warning.call_args.args[2])
+            make.assert_not_called()
+        self.assertFalse(list(self.output.glob("backup_before_config_*")))
+
+    def test_review_only_runs_thread_and_persists_only_review_results(self):
+        source = self.root / "images"
+        source.mkdir()
+        records = {}
+        for name, status in (("review_1.jpg", "review"), ("review_2.jpg", "review"),
+                             ("auto.jpg", "auto"), ("manual.jpg", "confirmed")):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+            records[name] = {"name": name, "status": status, "objects": [],
+                             "candidates": [], "candidate_count": 0, "reason": "原记录"}
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        for record in records.values():
+            append_record(self.output / "review.jsonl", record)
+        self.window.load_project()
+        self.window.follow_check.setChecked(False)
+        calls = []
+
+        class FakeSegmenter:
+            def __init__(self, model_path, device, conf):
+                self.device, self.conf = device, conf
+
+            def detect_many(self, image, prompts):
+                calls.append(image.shape)
+                return [{"class_id": 0, "score": 0.9, "box": [20, 10, 80, 45]}]
+
+        with patch.object(self.window, "validate_model_ready"), \
+                patch.object(ui, "GrayGloveSegmenter", FakeSegmenter):
+            self.window.recheck_review_images()
+            deadline = time.monotonic() + 10
+            while self.window.thread is not None and time.monotonic() < deadline:
+                self.qt.processEvents()
+                time.sleep(0.01)
+            self.qt.processEvents()
+        self.assertIsNone(self.window.thread)
+        self.assertEqual(len(calls), 2)
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["auto.jpg"], records["auto.jpg"])
+        self.assertEqual(saved["manual.jpg"], records["manual.jpg"])
+        self.assertNotEqual(saved["review_1.jpg"], records["review_1.jpg"])
+        self.assertNotEqual(saved["review_2.jpg"], records["review_2.jpg"])
+        self.assertEqual(self.window.table.rowCount(), 4)
 
     def test_changing_source_does_not_transfer_manual_labels_by_filename(self):
         for folder in ("first", "second"):

@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (
 
 from .app import torch
 from .app_generic import (
-    GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread,
+    GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread, backup_project,
+    replace_project_config,
     SELECTED_COLOR, UNSELECTED_COLOR,
 )
 from .barcode_core import image_files, load_records
@@ -372,12 +373,25 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self._detect_after_video_import = False
         self._video_import_succeeded = False
         self._loaded_video_folder = None
+        self._review_recheck_names = None
+        self._review_recheck_failures = []
         self._visible_rows = 0
         self._run_started_at = None
         self._run_start_done = None
         self._focus_view = False
         super().__init__()
         self._building_gray = False
+        outer = self.centralWidget().layout()
+        self.recheck_review_button = QPushButton("仅重检待人工复核")
+        self.recheck_review_button.setToolTip(
+            "使用当前设置重新检测所有待人工复核图片，保留其他状态和全部列表。")
+        self.recheck_review_button.clicked.connect(self.recheck_review_images)
+        for index in range(outer.count()):
+            controls = outer.itemAt(index).layout()
+            if controls is not None and controls.indexOf(self.start_button) >= 0:
+                controls.insertWidget(controls.indexOf(self.start_button) + 1,
+                                      self.recheck_review_button)
+                break
         self.setWindowTitle("灰色手套 · 视频抽帧 / SAM3 标注 / 人工复核")
         self.output_edit.setText(str(DEFAULT_OUTPUT))
         self.set_classes(GRAY_GLOVE_CLASSES)
@@ -727,6 +741,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
     def set_config_controls(self, enabled):
         super().set_config_controls(enabled)
+        if hasattr(self, "recheck_review_button"):
+            available = enabled and not (self.video_thread and self.video_thread.isRunning())
+            self.recheck_review_button.setEnabled(available)
         self.class_table.setEnabled(False)
         for button in self.class_buttons:
             button.setEnabled(False)
@@ -820,6 +837,85 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             f"  ·  已确认 {counts['confirmed']}  ·  无目标 {counts['empty_confirmed']}"
             f"  ·  自动候选 {counts['auto']}  ·  未抽中 {counts['skipped']}")
 
+    def recheck_review_images(self):
+        """Reprocess only saved review records without resetting other statuses."""
+        if ((self.thread is not None and self.thread.isRunning()) or
+                (self.video_thread is not None and self.video_thread.isRunning())):
+            self.status.setText("请先停止当前任务，再重检待复核图片。")
+            return
+        try:
+            source, output = self.source_dir(), self.output_dir()
+            project_path = output / "project.json"
+            if not project_path.is_file():
+                raise ValueError("请先载入包含已有检测记录的灰色手套项目。")
+            previous = json.loads(project_path.read_text(encoding="utf-8"))
+            if previous.get("workflow") != WORKFLOW:
+                raise ValueError("结果目录属于其他标注任务，请选择灰色手套项目。")
+            if Path(previous["source_dir"]).expanduser().resolve() != source:
+                raise ValueError("图片目录与已保存项目不一致，请先载入原项目。")
+            if not source.is_dir():
+                raise ValueError(f"图片目录不存在: {source}")
+            records = load_records(output / "review.jsonl")
+            names = sorted(name for name, record in records.items()
+                           if record.get("status") == "review")
+            if not names:
+                self.status.setText("当前项目没有待人工复核图片。")
+                return
+            missing = [name for name in names
+                       if Path(name).name != name or not (source / name).is_file()]
+            if missing:
+                raise ValueError(f"有 {len(missing)} 张待复核图片不存在或名称无效：\n{missing[0]}")
+            config = self.config()
+            self.validate_model_ready()
+            backup_project(output)
+            replace_project_config(project_path, config)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            QMessageBox.warning(self, "无法重检待复核图片", str(exc))
+            return
+
+        self.records = records
+        self.active_source, self.active_output, self.active_config = source, output, config
+        self.search_edit.clear()
+        self.status_filter.setCurrentIndex(self.status_filter.findData("all"))
+        self.review_filter.setChecked(False)
+        self.table.setRowCount(0)
+        self.row_for_name.clear()
+        self._visible_rows = 0
+        for record in sorted(records.values(), key=lambda item: item["name"]):
+            self.update_table(record)
+        self.update_counts()
+        self.apply_filter()
+        self._review_recheck_names = set(names)
+        self._review_recheck_failures = []
+        self._run_started_at = time.monotonic()
+        self._run_start_done = None
+        self._deleted_during_run.clear()
+        self.thread = self.make_detection_thread([source / name for name in names], config, set())
+        self.thread.result_signal.connect(self.receive_result)
+        self.thread.progress_signal.connect(self.update_progress)
+        self.thread.message_signal.connect(self.status.setText)
+        self.thread.finished.connect(self.detection_finished)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+        self.output_edit.setEnabled(False)
+        self.path_buttons[1].setEnabled(False)
+        self.set_config_controls(False)
+        self.progress_detail.setText(f"正在准备重检 {len(names)} 张待复核图片...")
+        self.thread.start()
+
+    def receive_result(self, record):
+        if self._review_recheck_names is not None:
+            name = record.get("name")
+            if (name not in self._review_recheck_names or
+                    self.records.get(name, {}).get("status") != "review"):
+                return
+            self._review_recheck_names.discard(name)
+            if str(record.get("reason", "")).startswith("检测失败:"):
+                self._review_recheck_failures.append(name)
+                return
+        super().receive_result(record)
+
     def start_detection(self):
         if self.video_thread is not None and self.video_thread.isRunning():
             self.status.setText("抽帧完成后才能开始自动检测。")
@@ -864,10 +960,16 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
     def detection_finished(self):
         stopped = self.thread is not None and not self.thread.running
+        review_only = self._review_recheck_names is not None
+        failures = len(self._review_recheck_failures)
         super().detection_finished()
         self.progress_detail.setText(
-            f"检测{'已停止' if stopped else '已完成'}："
+            f"{'待复核重检' if review_only else '检测'}{'已停止' if stopped else '已完成'}："
             f"{self.progress.value()}/{self.progress.maximum()} 张")
+        if review_only and failures:
+            self.status.setText(f"{failures} 张重检失败，已保留原复核记录。")
+        self._review_recheck_names = None
+        self._review_recheck_failures = []
         self._run_started_at = None
 
     def clear_all_labels(self):
