@@ -13,8 +13,32 @@ import uuid
 
 import cv2
 
+from .orbbec_undistort import camera_id_for_video
+
 
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"})
+
+
+def frame_camera_ids(folder: Path) -> dict[str, str]:
+    """Read source-camera IDs from batch manifests when available."""
+    result = {}
+    for manifest_path in Path(folder).glob("extract_*.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            frames = manifest["frames"]
+            transform = manifest["settings"].get("transform", {})
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"抽帧来源记录无法读取: {manifest_path}") from exc
+        for frame in frames:
+            video = frame["video"]
+            camera_id = transform.get(video, {}).get("camera_id")
+            if camera_id is None:
+                try:
+                    camera_id = camera_id_for_video(Path(video))
+                except ValueError:
+                    continue
+            result[frame["name"]] = camera_id
+    return result
 
 
 def collect_videos(paths) -> list[Path]:
@@ -82,7 +106,8 @@ def _frame_plan(video: Path, interval_mode: str, interval_value: float,
 def extract_video_batch(videos, output: Path, interval_mode: str,
                         interval_value: float, start_seconds: float = 0.0,
                         end_seconds: float | None = None, progress=None,
-                        should_continue=None, target_dir: Path | None = None
+                        should_continue=None, target_dir: Path | None = None,
+                        frame_transform=None, transform_info: dict | None = None
                         ) -> tuple[Path, int, int]:
     """Append reproducibly named frames to one label directory and resume partial runs.
 
@@ -101,6 +126,8 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
     if end_seconds is not None and (not math.isfinite(end_seconds)
                                     or end_seconds <= start_seconds):
         raise ValueError("结束时间必须大于开始时间")
+    if (frame_transform is None) != (transform_info is None):
+        raise ValueError("去畸变处理与来源记录必须同时指定")
     output = Path(output).expanduser().resolve()
     target = (Path(target_dir).expanduser().resolve() if target_dir is not None
               else output / "video_frames" / "collection")
@@ -109,13 +136,19 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
         raise ValueError("抽帧目录必须位于结果目录的 video_frames 中")
     settings = {"interval_mode": interval_mode, "interval_value": interval_value,
                 "start_seconds": start_seconds, "end_seconds": end_seconds}
+    if transform_info is not None:
+        settings["transform"] = transform_info
     planned = []
     source_info = []
     for video in videos:
         stat = video.stat()
         fps, source_count, indices = _frame_plan(
             video, interval_mode, interval_value, start_seconds, end_seconds)
-        signature = json.dumps([str(video), stat.st_size, stat.st_mtime_ns, settings],
+        source_settings = {key: value for key, value in settings.items()
+                           if key != "transform"}
+        if transform_info is not None:
+            source_settings["transform"] = transform_info[str(video)]
+        signature = json.dumps([str(video), stat.st_size, stat.st_mtime_ns, source_settings],
                                sort_keys=True)
         source_id = hashlib.sha256(signature.encode()).hexdigest()[:10]
         stem = re.sub(r"[^A-Za-z0-9_-]+", "_", video.stem).strip("_")[:48] or "video"
@@ -166,6 +199,8 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
                 ok, image = capture.read()
                 if not ok or image is None:
                     raise ValueError(f"视频第 {index} 帧无法解码: {video}")
+                if frame_transform is not None:
+                    image = frame_transform(video, image)
                 temporary = target / f".{name}.{uuid.uuid4().hex}.jpg"
                 try:
                     if not cv2.imwrite(str(temporary), image,

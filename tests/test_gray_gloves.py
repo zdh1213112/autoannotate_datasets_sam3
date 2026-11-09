@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cv2
 import numpy as np
+import yaml
 from PyQt5.QtCore import QCoreApplication, QEvent, QLibraryInfo
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import QApplication, QScrollArea
@@ -134,6 +135,16 @@ class GrayGloveVideoTests(unittest.TestCase):
         self.assertEqual(single["status"], "review")
         self.assertTrue(single["side_pending"])
 
+    def test_side_camera_requires_review_of_left_right_labels(self):
+        record = {"status": "auto", "objects": [{"class_id": 0}],
+                  "reason": "自动候选"}
+        self.assertEqual(ui.flag_side_camera_review(record, "cam_0")["status"],
+                         "auto")
+        side = ui.flag_side_camera_review(record, "cam_2")
+        self.assertEqual(side["status"], "review")
+        self.assertEqual(side["camera_id"], "cam_2")
+        self.assertIn("侧视相机", side["reason"])
+
 
 class GrayGloveUITests(unittest.TestCase):
     @classmethod
@@ -248,6 +259,41 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertTrue((legacy / "old.jpg").is_file())
         self.assertEqual(len(list(legacy.glob("*.jpg"))), 3)
         self.assertEqual(load_records(self.output / "review.jsonl")["old.jpg"], old_record)
+
+    def test_undistorted_import_uses_separate_project_and_keeps_raw_labels(self):
+        raw_source = self.output / "video_frames" / "legacy"
+        raw_source.mkdir(parents=True)
+        cv2.imwrite(str(raw_source / "old.jpg"), np.zeros((60, 80, 3), np.uint8))
+        self.window.input_edit.setText(str(raw_source))
+        self.window.ensure_project()
+        old_record = {"name": "old.jpg", "status": "confirmed", "objects": [],
+                      "candidates": [], "candidate_count": 0}
+        append_record(self.output / "review.jsonl", old_record)
+        video = self.root / "EGO_camera_left.mp4"
+        make_video(video)
+        calibration = self.root / "EGO_calibration_camera.yaml"
+        calibration.write_text(yaml.safe_dump({"cameras": [{
+            "id": "cam_0", "distortion_model": "KB",
+            "image_width": 80, "image_height": 60,
+            "intrinsics": {"fx": 45, "fy": 45, "cx": 40, "cy": 30},
+            "distortion": {"k1": 0.08, "k2": -0.01, "k3": 0.001, "k4": 0},
+        }]}), encoding="utf-8")
+        self.window.video_edit.setText(str(video))
+        self.window.end_check.setChecked(True)
+        self.window.end_spin.setValue(0.2)
+        self.window.import_video(undistort=True)
+        deadline = time.monotonic() + 10
+        while self.window.video_thread is not None and time.monotonic() < deadline:
+            self.qt.processEvents()
+            time.sleep(0.01)
+        self.qt.processEvents()
+        rectified_output = self.root / "out_undistorted"
+        self.assertEqual(self.window.output_edit.text(), str(rectified_output))
+        self.assertEqual(self.window.input_edit.text(),
+                         str(rectified_output / "video_frames" / "collection"))
+        self.assertEqual(len(list((rectified_output / "video_frames" / "collection").glob("*.jpg"))), 1)
+        self.assertEqual(load_records(self.output / "review.jsonl")["old.jpg"], old_record)
+        self.assertEqual(self.window.video_target_dir(self.output), raw_source)
 
     def test_prompt_ensemble_merges_candidates_before_side_assignment(self):
         fake = [{"class_id": index, "box": [0, 0, 20, 20], "score": 0.9}

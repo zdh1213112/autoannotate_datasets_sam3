@@ -22,7 +22,8 @@ from PyQt5.QtWidgets import (
 from .app import torch
 from .app_generic import GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread
 from .generic_core import detect_generic
-from .gray_glove_video import collect_videos, extract_video_batch
+from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
+from .orbbec_undistort import OrbbecUndistorter
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
@@ -94,6 +95,18 @@ def _update_candidate_sides(record: dict, width: int, mapping: str):
             candidate["class_id"] = side if mapping == "screen" else 1 - side
 
 
+def flag_side_camera_review(record: dict, camera_id: str | None) -> dict:
+    """Side views need a person to confirm physical left/right identity."""
+    if camera_id is None:
+        return record
+    result = {**record, "camera_id": camera_id}
+    if (camera_id in {"cam_2", "cam_3"} and result.get("objects")
+            and result.get("status") == "auto"):
+        result["status"] = "review"
+        result["reason"] = "侧视相机的左右手仅按画面位置建议，请人工确认"
+    return result
+
+
 class LargePreviewDialog(QDialog):
     """Inspect the full-resolution image with its current selection colors."""
 
@@ -157,6 +170,7 @@ class GrayGloveThread(GenericThread):
     def run(self):
         try:
             todo = [path for path in self.files if path.name not in self.done_names]
+            camera_ids = frame_camera_ids(Path(self.config["source_dir"]))
             total = len(self.files)
             completed = total - len(todo)
             self.progress_signal.emit(completed, total)
@@ -188,6 +202,8 @@ class GrayGloveThread(GenericThread):
                     result = assign_glove_sides(
                         result, image.shape[1],
                         self.config.get("side_mapping", "screen"))
+                    result = flag_side_camera_review(
+                        result, camera_ids.get(path.name))
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])
                 except Exception as exc:
@@ -205,12 +221,14 @@ class GrayGloveThread(GenericThread):
 
 class VideoFrameThread(QThread):
     progress_signal = pyqtSignal(int, int)
-    complete_signal = pyqtSignal(str, int, int)
+    complete_signal = pyqtSignal(str, int, int, str)
     error_signal = pyqtSignal(str)
 
     def __init__(self, videos: list[Path], output: Path, interval_mode: str,
                  interval_value: float, start_seconds: float,
-                 end_seconds: float | None, target_dir: Path | None):
+                 end_seconds: float | None, target_dir: Path | None,
+                 undistort: bool = False, calibration: Path | None = None,
+                 balance: float = 0.0):
         super().__init__()
         self.videos = videos
         self.output = output
@@ -219,6 +237,9 @@ class VideoFrameThread(QThread):
         self.start_seconds = start_seconds
         self.end_seconds = end_seconds
         self.target_dir = target_dir
+        self.undistort = undistort
+        self.calibration = calibration
+        self.balance = balance
         self.running = True
 
     def stop(self):
@@ -226,13 +247,17 @@ class VideoFrameThread(QThread):
 
     def run(self):
         try:
+            rectifier = (OrbbecUndistorter(self.videos, self.calibration, self.balance)
+                         if self.undistort else None)
             folder, count, reused = extract_video_batch(
                 self.videos, self.output, self.interval_mode,
                 self.interval_value, self.start_seconds, self.end_seconds,
                 progress=lambda done, total: self.progress_signal.emit(done, total),
-                should_continue=lambda: self.running, target_dir=self.target_dir)
-            self.complete_signal.emit(str(folder), count, reused)
-        except (OSError, ValueError, InterruptedError) as exc:
+                should_continue=lambda: self.running, target_dir=self.target_dir,
+                frame_transform=rectifier,
+                transform_info=rectifier.metadata if rectifier is not None else None)
+            self.complete_signal.emit(str(folder), count, reused, str(self.output))
+        except Exception as exc:
             self.error_signal.emit(str(exc))
 
 
@@ -343,6 +368,28 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.video_progress = QLabel("尚未抽帧；也可直接选择已有图片目录")
         interval_row.addWidget(self.video_progress, 1)
         video_layout.addLayout(interval_row)
+        undistort_row = QHBoxLayout()
+        undistort_row.addWidget(QLabel("Orbbec 标定"))
+        self.calibration_edit = QLineEdit()
+        self.calibration_edit.setPlaceholderText("留空：按每个视频所在目录自动查找四目标定 YAML")
+        self.calibration_edit.setToolTip(
+            "手动指定仅适合所选视频共用同一标定；留空可按每段视频自动匹配。")
+        undistort_row.addWidget(self.calibration_edit, 1)
+        self.calibration_button = QPushButton("选择标定")
+        self.calibration_button.clicked.connect(self.choose_calibration)
+        undistort_row.addWidget(self.calibration_button)
+        undistort_row.addWidget(QLabel("保留视野"))
+        self.balance_spin = QDoubleSpinBox()
+        self.balance_spin.setRange(0.0, 1.0)
+        self.balance_spin.setSingleStep(0.1)
+        self.balance_spin.setValue(0.0)
+        self.balance_spin.setToolTip("0 减少黑边并让手更大；1 保留更宽视野，可能有大片黑边。")
+        undistort_row.addWidget(self.balance_spin)
+        self.undistort_button = QPushButton("按当前设置去畸变抽帧并载入")
+        self.undistort_button.clicked.connect(
+            lambda: self.import_video(undistort=True))
+        undistort_row.addWidget(self.undistort_button)
+        video_layout.addLayout(undistort_row)
         outer = self.centralWidget().layout()
         outer.insertWidget(1, self.video_group)
         self.focus_button = QPushButton("进入大图复核 [Alt+S]")
@@ -467,7 +514,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
                            self.video_list, self.remove_video_button,
                            self.clear_video_button, self.interval_mode,
                            self.interval_spin, self.start_spin, self.end_check,
-                           self.import_button):
+                           self.import_button, self.calibration_edit,
+                           self.calibration_button, self.balance_spin,
+                           self.undistort_button):
                 widget.setEnabled(available)
             self.end_spin.setEnabled(available and self.end_check.isChecked())
 
@@ -566,6 +615,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def show_record(self, name):
         super().show_record(name)
         record = self.records.get(name)
+        if record and record.get("camera_id"):
+            self.preview_title.setText(
+                self.preview_title.text() + f"  |  {record['camera_id']}")
         if record and record.get("side_pending") and record.get("objects"):
             self.preview_title.setText(
                 self.preview_title.text() + "  |  左右未确认：按 Alt+1 / Alt+2")
@@ -697,6 +749,16 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if folder:
             self.add_video_paths([folder])
 
+    def choose_calibration(self):
+        start = self.calibration_edit.text().strip()
+        if not start and self.video_list.count():
+            start = str(Path(self.video_list.item(0).text()).parent)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 Orbbec 四目标定 YAML", start,
+            "相机标定 (*.yaml *.yml)")
+        if path:
+            self.calibration_edit.setText(path)
+
     def add_video_paths(self, paths):
         try:
             videos = collect_videos(paths)
@@ -743,9 +805,28 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if (source is not None and self.active_output == output and source.is_dir()
                 and source.is_relative_to(output / "video_frames")):
             return source
+        project_path = output / "project.json"
+        if project_path.is_file():
+            try:
+                previous = json.loads(project_path.read_text(encoding="utf-8"))
+                source = Path(previous["source_dir"]).expanduser().resolve()
+                if source.is_dir() and source.is_relative_to(output / "video_frames"):
+                    return source
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         return output / "video_frames" / "collection"
 
-    def import_video(self):
+    def output_for_video_mode(self, undistort: bool) -> Path:
+        """Use separate annotation projects for raw and rectified coordinates."""
+        output = self.output_dir()
+        suffix = "_undistorted"
+        if undistort and not output.name.endswith(suffix):
+            return output.with_name(output.name + suffix)
+        if not undistort and output.name.endswith(suffix):
+            return output.with_name(output.name[:-len(suffix)])
+        return output
+
+    def import_video(self, undistort: bool = False):
         if self.thread is not None and self.thread.isRunning():
             self.status.setText("请先停止自动检测，再切换视频。")
             return
@@ -759,8 +840,10 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             videos = collect_videos(sources)
             if self.end_check.isChecked() and self.end_spin.value() <= self.start_spin.value():
                 raise ValueError("结束时间必须大于开始时间")
-            output = self.output_dir()
+            output = self.output_for_video_mode(undistort)
             target = self.video_target_dir(output)
+            calibration = (Path(self.calibration_edit.text().strip()).expanduser().resolve()
+                           if undistort and self.calibration_edit.text().strip() else None)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法抽帧", str(exc))
             return
@@ -768,7 +851,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             videos, output, self.interval_mode.currentData(),
             self.interval_spin.value(), self.start_spin.value(),
             self.end_spin.value() if self.end_check.isChecked() else None,
-            target)
+            target, undistort, calibration, self.balance_spin.value())
         self.video_thread.progress_signal.connect(self.update_video_progress)
         self.video_thread.complete_signal.connect(self.video_imported)
         self.video_thread.error_signal.connect(self.video_import_error)
@@ -776,13 +859,18 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.set_config_controls(False)
-        self.video_progress.setText(f"正在抽帧：{len(videos)} 个视频...")
+        action = "去畸变并抽帧" if undistort else "抽帧"
+        self.video_progress.setText(f"正在{action}：{len(videos)} 个视频...")
         self.video_thread.start()
 
     def update_video_progress(self, done, total):
         self.video_progress.setText(f"抽帧 {done}/{total} 张")
 
-    def video_imported(self, folder, count, reused):
+    def video_imported(self, folder, count, reused, output):
+        action = "去畸变抽帧" if self.video_thread and self.video_thread.undistort else "抽帧"
+        if self.output_dir() != Path(output):
+            self.output_edit.setText(output)
+            self.load_project()
         old_source = self.input_edit.text().strip()
         self.input_edit.setText(folder)
         if old_source != folder:
@@ -790,13 +878,15 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.show_roi()
         self.update_sample_summary()
         self.video_progress.setText(
-            f"抽帧完成 {count} 张（复用 {reused} 张）；按 F5 开始标注")
+            f"{action}完成 {count} 张（复用 {reused} 张）；按 F5 开始标注")
         self.status.setText(f"图片目录已切换到 {folder}；可调抽样比例后按 F5。")
 
     def video_import_error(self, message):
         self.video_progress.setText(message)
         if not message.startswith("已停止抽帧"):
-            QMessageBox.warning(self, "抽帧失败", message)
+            action = ("去畸变抽帧失败" if self.video_thread and self.video_thread.undistort
+                      else "抽帧失败")
+            QMessageBox.warning(self, action, message)
 
     def video_import_finished(self):
         self.video_thread = None
