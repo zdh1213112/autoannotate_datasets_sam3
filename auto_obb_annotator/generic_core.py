@@ -19,7 +19,7 @@ from .generic_region import (
 
 
 AUTO_SCORE = 0.50
-NMS_IOU = 0.70
+NMS_IOU = 0.60
 NMS_SMALLER_COVERAGE = 0.80
 REVIEW_RULES = (
     ("missing", "未检测到目标"),

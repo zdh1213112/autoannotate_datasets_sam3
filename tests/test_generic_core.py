@@ -140,6 +140,26 @@ class GenericCoreTests(unittest.TestCase):
             {"polygon": [[85, 50], [140, 50], [140, 130], [85, 130]]}]}
         self.assertTrue(has_duplicate_selected_boxes(old_record))
 
+    def test_overlapping_rotated_and_straight_boxes_are_one_hand(self):
+        # A straight and a rotated prediction from one glove can have IoU
+        # around 0.64 even though their centers nearly coincide.
+        old_record = {"objects": [
+            {"polygon": [[716, 561], [885, 561], [885, 684], [716, 684]]},
+            {"polygon": [[699, 615], [747, 516], [919, 601], [871, 700]]},
+        ]}
+        self.assertTrue(has_duplicate_selected_boxes(old_record))
+        detections = [
+            {"class_id": 0, "box": [50, 50, 150, 150], "score": 0.94},
+            {"class_id": 1, "box": [71, 50, 171, 150], "score": 0.92},
+            {"class_id": 0, "box": [200, 50, 260, 150], "score": 0.80},
+        ]
+        result = select_detections(self.image, [0, 0, 1, 1], detections,
+                                   2, "fixed", 2, selection_rule="area")
+        self.assertEqual([obj["score"] for obj in result["objects"]],
+                         [0.94, 0.80])
+        self.assertEqual([item["selected"] for item in result["candidates"]],
+                         [True, False, True])
+
     def test_all_mode_keeps_every_distinct_candidate(self):
         result = select_detections(self.image, self.roi, self.detections, 2, "all", 1)
         self.assertEqual(len(result["objects"]), 3)
