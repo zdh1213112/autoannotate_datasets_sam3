@@ -27,9 +27,10 @@ from .app_barcode import SingleBoxDialog
 from .barcode_core import append_record, image_files, load_records
 from .button_shortcuts import ButtonShortcuts
 from .generic_core import (
-    REVIEW_RULES, detect_generic, export_generic, normalize_review_reasons,
-    normalize_sample_percent, normalize_sample_seed, normalize_selection_rule,
-    sample_image_files,
+    REVIEW_RULES, detect_generic, export_generic, has_duplicate_selected_boxes,
+    normalize_review_reasons,
+    normalize_review_score, normalize_sample_percent, normalize_sample_seed,
+    normalize_selection_rule, recheck_review_scores, sample_image_files,
     sync_candidates, validate_classes,
 )
 from .generic_region import (
@@ -203,6 +204,7 @@ class GenericThread(QThread):
                         self.config["target_count"],
                         self.config.get("review_reasons"),
                         self.config.get("selection_rule"),
+                        self.config.get("review_score"),
                     )
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])
@@ -320,6 +322,15 @@ class GenericAnnotatorApp(QMainWindow):
             self.review_reason_checks[key] = check
             reasons_row.addWidget(check)
         grid.addLayout(reasons_row, 6, 1, 1, 4)
+        self.review_score_spin = QDoubleSpinBox()
+        self.review_score_spin.setRange(0.05, 0.95)
+        self.review_score_spin.setSingleStep(0.05)
+        self.review_score_spin.setDecimals(2)
+        self.review_score_spin.setValue(0.50)
+        self.review_score_spin.setToolTip(
+            "已选标签框低于此置信度时进入人工复核；与最低检测置信度分别设置。")
+        reasons_row.addWidget(QLabel("低分复核阈值"))
+        reasons_row.addWidget(self.review_score_spin)
         self.sample_percent_spin = QSpinBox()
         self.sample_percent_spin.setRange(1, 100)
         self.sample_percent_spin.setValue(100)
@@ -508,6 +519,7 @@ class GenericAnnotatorApp(QMainWindow):
         self.config_locked = not enabled
         for widget in (self.input_edit, self.roi_button, self.full_button,
                        self.class_table, self.count_combo, self.confidence_spin,
+                       self.review_score_spin,
                        self.sample_percent_spin,
                        self.path_buttons[0], *self.class_buttons,
                        *self.review_reason_checks.values()):
@@ -583,6 +595,8 @@ class GenericAnnotatorApp(QMainWindow):
                     self.sample_percent_spin.value()),
                 "sample_seed": normalize_sample_seed(self.sample_seed),
                 "confidence": self.confidence_spin.value(),
+                "review_score": normalize_review_score(
+                    self.review_score_spin.value()),
                 "review_reasons": [key for key, check in self.review_reason_checks.items()
                                    if check.isChecked()]}
 
@@ -608,6 +622,8 @@ class GenericAnnotatorApp(QMainWindow):
                 raise ValueError("项目中的检测区域无效")
             reasons = normalize_review_reasons(config.get("review_reasons"))
             config["review_reasons"] = reasons
+            config["review_score"] = normalize_review_score(
+                config.get("review_score"))
             config["selection_rule"] = normalize_selection_rule(
                 config.get("selection_rule"))
             config["sample_percent"] = normalize_sample_percent(
@@ -628,6 +644,7 @@ class GenericAnnotatorApp(QMainWindow):
             self.sample_percent_spin.setValue(config["sample_percent"])
             self.update_sample_summary()
             self.confidence_spin.setValue(float(config["confidence"]))
+            self.review_score_spin.setValue(config["review_score"])
             self.active_source = Path(config["source_dir"])
             self.active_output = self.output_dir()
             self.active_config = config
@@ -656,6 +673,9 @@ class GenericAnnotatorApp(QMainWindow):
             previous["roi"] = normalize_region(previous.get("roi"))
             previous["review_reasons"] = normalize_review_reasons(
                 previous.get("review_reasons"))
+            missing_review_score = "review_score" not in previous
+            previous["review_score"] = normalize_review_score(
+                previous.get("review_score"))
             previous["selection_rule"] = normalize_selection_rule(
                 previous.get("selection_rule"))
             previous["sample_percent"] = normalize_sample_percent(
@@ -664,7 +684,32 @@ class GenericAnnotatorApp(QMainWindow):
             previous["sample_seed"] = normalize_sample_seed(
                 previous.get("sample_seed", config["sample_seed"]))
             needs_random_migration = missing_seed and previous["sample_percent"] < 100
-            if previous != config or needs_random_migration:
+            score_only_change = ((previous != config or missing_review_score) and
+                                 not needs_random_migration and
+                                 {key: value for key, value in previous.items()
+                                  if key != "review_score"} ==
+                                 {key: value for key, value in config.items()
+                                  if key != "review_score"})
+            if score_only_change:
+                if not allow_reconfigure:
+                    raise ValueError("配置已修改，请先按 F5 根据新配置重新检测，再导出。")
+                backup = backup_project(output)
+                updated = recheck_review_scores(
+                    load_records(output / "review.jsonl"), config["review_score"],
+                    "low_score" in config["review_reasons"])
+                review_path = output / "review.jsonl"
+                try:
+                    replace_review_records(review_path, updated)
+                    replace_project_config(path, config)
+                except OSError:
+                    old_review = backup / "review.jsonl"
+                    if old_review.exists():
+                        shutil.copy2(old_review, review_path)
+                    else:
+                        review_path.unlink(missing_ok=True)
+                    raise
+                self.records = updated
+            elif previous != config or needs_random_migration:
                 if not allow_reconfigure:
                     raise ValueError("配置已修改，请先按 F5 根据新配置重新检测，再导出。")
                 if previous["sample_percent"] != config["sample_percent"]:
@@ -778,7 +823,8 @@ class GenericAnnotatorApp(QMainWindow):
             name for name, record in self.records.items()
             if record.get("status") in {"confirmed", "empty_confirmed"} or
             (record.get("objects") and "candidates" in record and
-             record.get("reason") != "高分候选超过设定数量，请人工选择")
+             record.get("reason") != "高分候选超过设定数量，请人工选择" and
+             not has_duplicate_selected_boxes(record))
         }
         self._deleted_during_run.clear()
         self.thread = self.make_detection_thread(sampled, config, done_names)
@@ -870,8 +916,12 @@ class GenericAnnotatorApp(QMainWindow):
             self.follow_check.setChecked(False)
             self.show_record(name)
 
-    def color_for_candidate(self, candidate: dict) -> tuple[int, int, int]:
+    def color_for_candidate(self, candidate: dict, record: dict) -> tuple[int, int, int]:
         return SELECTED_COLOR if candidate["selected"] else UNSELECTED_COLOR
+
+    def display_class_name(self, class_id: int, record: dict,
+                           selected: bool = True) -> str:
+        return self.active_config["classes"][class_id]["name"]
 
     def show_record(self, name):
         record = self.records.get(name)
@@ -895,16 +945,16 @@ class GenericAnnotatorApp(QMainWindow):
         for candidate in sorted(display_record["candidates"],
                                 key=lambda item: bool(item["selected"])):
             class_id = int(candidate["class_id"])
-            color = self.color_for_candidate(candidate)
+            color = self.color_for_candidate(candidate, record)
             points = np.rint(candidate["polygon"]).astype(np.int32)
             cv2.polylines(image, [points], True, color, 3)
-            label = self.active_config["classes"][class_id]["name"]
+            label = self.display_class_name(class_id, record, candidate["selected"])
             anchor = points.min(axis=0)
             captions.append((max(2, int(anchor[0])), max(24, int(anchor[1]) - 5),
                              f"{label} {float(candidate.get('score', 0)):.2f}", color))
         for index, obj in enumerate(record.get("objects", [])):
             class_id = int(obj["class_id"])
-            label = self.active_config["classes"][class_id]["name"]
+            label = self.display_class_name(class_id, record)
             self.object_table.insertRow(index)
             for column, text in enumerate((str(index + 1), label,
                                            f"{obj.get('score', 0):.2f}")):

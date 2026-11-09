@@ -310,6 +310,42 @@ class GenericShortcutUITests(unittest.TestCase):
         self.assertTrue(self.window.sample_percent_spin.isEnabled())
         self.assertTrue(self.window.review_reason_checks["near_edge"].isEnabled())
 
+    def test_review_score_is_visible_and_updates_existing_results(self):
+        self.assertEqual(self.window.review_score_spin.value(), 0.50)
+        self.window.records["a.png"]["status"] = "confirmed"
+        self.window.records["b.png"]["objects"][0]["score"] = 0.65
+        self.window.records["c.png"]["objects"][0]["score"] = 0.65
+        self.window.records["c.png"]["reason"] = "存在低置信度目标，请人工检查"
+        for record in self.window.records.values():
+            append_record(self.output / "review.jsonl", record)
+        self.window.review_score_spin.setValue(0.70)
+        config = self.window.ensure_project(allow_reconfigure=True)
+        self.assertEqual(config["review_score"], 0.70)
+        self.assertEqual(self.window.records["a.png"]["status"], "confirmed")
+        self.assertEqual(self.window.records["b.png"]["status"], "review")
+        self.assertIn("0.70", self.window.records["b.png"]["reason"])
+        self.window.review_score_spin.setValue(0.50)
+        self.window.ensure_project(allow_reconfigure=True)
+        self.assertEqual(self.window.records["a.png"]["status"], "confirmed")
+        self.assertEqual(self.window.records["b.png"]["status"], "auto")
+        self.assertEqual(self.window.records["c.png"]["status"], "auto")
+        self.window.load_project()
+        self.assertEqual(self.window.review_score_spin.value(), 0.50)
+
+    def test_legacy_review_score_migrates_without_clearing_labels(self):
+        path = self.output / "project.json"
+        config = json.loads(path.read_text())
+        del config["review_score"]
+        path.write_text(json.dumps(config))
+        self.window.records["c.png"]["objects"][0]["score"] = 0.65
+        self.window.records["c.png"]["reason"] = "存在低置信度目标，请人工检查"
+        append_record(self.output / "review.jsonl", self.window.records["c.png"])
+        self.window.load_project()
+        self.window.ensure_project(allow_reconfigure=True)
+        self.assertEqual(self.window.records["c.png"]["status"], "auto")
+        self.assertEqual(json.loads(path.read_text())["review_score"], 0.50)
+        self.assertEqual(len(self.window.records["c.png"]["objects"]), 1)
+
     def test_sample_percentage_limits_detection_and_persists_skips(self):
         for index in (3, 4):
             cv2.imwrite(str(self.source / f"{index}.png"),
@@ -541,7 +577,30 @@ class GenericShortcutUITests(unittest.TestCase):
             worker = ui.GenericThread([self.source / "a.png"], config,
                                       set(), segmenter)
             worker.run()
-        self.assertEqual(detect.call_args.args[-1], "area")
+        self.assertEqual(detect.call_args.args[-2], "area")
+        self.assertEqual(detect.call_args.args[-1], 0.50)
+
+    def test_f5_retries_old_nested_boxes_and_keeps_confirmed_records(self):
+        first = self.window.records["a.png"]
+        first["status"] = "auto"
+        first["objects"] = [
+            {"class_id": 0, "score": 0.92,
+             "polygon": [[80, 20], [180, 20], [180, 110], [80, 110]]},
+            {"class_id": 0, "score": 0.38,
+             "polygon": [[90, 30], [145, 30], [145, 95], [90, 95]]},
+        ]
+        first["candidates"] = [{**obj, "selected": True}
+                               for obj in first["objects"]]
+        self.window.records["b.png"]["status"] = "confirmed"
+        for record in self.window.records.values():
+            append_record(self.output / "review.jsonl", record)
+        with patch.object(ui, "SAM3_MODEL", self.source / "a.png"), \
+                patch.object(ui, "GenericThread") as thread_class:
+            self.window.start_detection()
+        done_names = thread_class.call_args.args[2]
+        self.assertNotIn("a.png", done_names)
+        self.assertIn("b.png", done_names)
+        self.window.detection_finished()
 
 
 if __name__ == "__main__":

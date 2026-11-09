@@ -18,8 +18,9 @@ from .generic_region import (
 )
 
 
-AUTO_SCORE = 0.70
+AUTO_SCORE = 0.50
 NMS_IOU = 0.70
+NMS_SMALLER_COVERAGE = 0.80
 REVIEW_RULES = (
     ("missing", "未检测到目标"),
     ("short_count", "固定数量不足"),
@@ -76,6 +77,50 @@ def normalize_review_reasons(reasons=None) -> list[str]:
     return [key for key in DEFAULT_REVIEW_REASONS if key in reasons]
 
 
+def normalize_review_score(score=None) -> float:
+    if score is None:
+        return AUTO_SCORE
+    try:
+        value = float(score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("低置信度复核阈值无效") from exc
+    if not np.isfinite(value) or not 0.05 <= value <= 0.95:
+        raise ValueError("低置信度复核阈值必须在 0.05 到 0.95 之间")
+    return value
+
+
+def low_score_reason(score: float) -> str:
+    return f"存在低置信度目标（低于 {score:.2f}），请人工检查"
+
+
+def recheck_review_scores(records: dict[str, dict], score: float,
+                          enabled: bool = True) -> dict[str, dict]:
+    """Update automatic review states when only the low-score cutoff changes."""
+    score = normalize_review_score(score)
+    updated = {}
+    for name, original in records.items():
+        record = dict(original)
+        status = record.get("status")
+        reason = str(record.get("reason", ""))
+        was_low_review = status == "review" and reason.startswith("存在低置信度目标")
+        is_low = enabled and any(float(obj.get("score", 1.0)) < score
+                                 for obj in record.get("objects", []))
+        if status == "auto" and is_low:
+            record.update(status="review", reason=low_score_reason(score))
+        elif was_low_review:
+            side_unresolved = (record.get("camera_id") in {"cam_2", "cam_3"}
+                               and record.get("objects")
+                               and not record.get("side_autoclassified"))
+            if is_low:
+                record["reason"] = low_score_reason(score)
+            elif side_unresolved:
+                record["reason"] = "侧视相机的左右手仍待人工确认"
+            else:
+                record.update(status="auto", reason="自动候选，可人工复核")
+        updated[name] = record
+    return updated
+
+
 def validate_classes(classes: list[dict]) -> list[dict]:
     if not classes:
         raise ValueError("请至少添加一个类别")
@@ -130,21 +175,39 @@ def _polygon_from_mask(mask, box, height: int, width: int):
     return polygon if cv2.contourArea(polygon) >= 25 else None
 
 
-def _polygon_iou(first, second) -> float:
+def _polygons_duplicate(first, second) -> bool:
     intersection, _ = cv2.intersectConvexConvex(first, second)
-    union = cv2.contourArea(first) + cv2.contourArea(second) - intersection
-    return float(intersection / union) if union > 0 else 0.0
+    first_area, second_area = cv2.contourArea(first), cv2.contourArea(second)
+    union = first_area + second_area - intersection
+    smaller = min(first_area, second_area)
+    return (union > 0 and intersection / union >= NMS_IOU or
+            smaller > 0 and intersection / smaller >= NMS_SMALLER_COVERAGE)
+
+
+def has_duplicate_selected_boxes(record: dict) -> bool:
+    """Identify old auto results that should be reselected after NMS changes."""
+    polygons = []
+    for obj in record.get("objects", []):
+        polygon = np.asarray(obj.get("polygon", []), dtype=np.float32)
+        if polygon.shape != (4, 2):
+            continue
+        if any(_polygons_duplicate(polygon, previous) for previous in polygons):
+            return True
+        polygons.append(polygon)
+    return False
 
 
 def select_detections(image, roi, detections: list[dict], class_count: int,
                       count_mode: str, target_count: int,
-                      review_reasons=None, selection_rule=None) -> dict:
+                      review_reasons=None, selection_rule=None,
+                      review_score=None) -> dict:
     """Keep every in-region prediction and select deduplicated output labels."""
     if count_mode not in {"all", "fixed"}:
         raise ValueError(f"未知目标数量模式: {count_mode}")
     if count_mode == "fixed" and target_count < 1:
         raise ValueError("固定目标数至少为 1")
     selection_rule = normalize_selection_rule(selection_rule)
+    review_score = normalize_review_score(review_score)
     enabled_reasons = set(normalize_review_reasons(review_reasons))
     height, width = image.shape[:2]
     x1, y1, x2, y2 = region_bounds(roi, width, height)
@@ -176,7 +239,8 @@ def select_detections(image, roi, detections: list[dict], class_count: int,
     ambiguous_class = False
     for index, candidate in ranked:
         duplicate = next((kept for _, kept in unique
-                          if _polygon_iou(candidate["polygon"], kept["polygon"]) >= NMS_IOU),
+                          if _polygons_duplicate(candidate["polygon"],
+                                                 kept["polygon"])),
                          None)
         if duplicate is not None:
             if (candidate["class_id"] != duplicate["class_id"] and
@@ -209,8 +273,8 @@ def select_detections(image, roi, detections: list[dict], class_count: int,
         triggered.append(("class_conflict", "同一位置匹配多个类别，请人工核对类别"))
     if near_edge:
         triggered.append(("near_edge", "目标贴近标注区域边缘，请人工检查"))
-    if any(item["score"] < AUTO_SCORE for _, item in chosen):
-        triggered.append(("low_score", "存在低置信度目标，请人工检查"))
+    if any(item["score"] < review_score for _, item in chosen):
+        triggered.append(("low_score", low_score_reason(review_score)))
     selected = next((text for key, text in triggered if key in enabled_reasons), None)
     if selected:
         status, reason = "review", selected
@@ -250,12 +314,13 @@ def sync_candidates(record: dict) -> dict:
 
 def detect_generic(image, roi, segmenter, classes: list[dict],
                    count_mode: str, target_count: int,
-                   review_reasons=None, selection_rule=None) -> dict:
+                   review_reasons=None, selection_rule=None,
+                   review_score=None) -> dict:
     detections = segmenter.detect_many(
         crop_region(image, roi), [item["prompt"] for item in classes])
     return select_detections(image, roi, detections, len(classes),
                              count_mode, target_count, review_reasons,
-                             selection_rule)
+                             selection_rule, review_score)
 
 
 def yolo_row(obj: dict, width: int, height: int, box_format: str,

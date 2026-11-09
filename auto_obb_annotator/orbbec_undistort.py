@@ -20,13 +20,14 @@ CAMERA_SUFFIXES = (
 
 
 def camera_id_for_video(video: Path) -> str:
-    stem = Path(video).stem.lower()
+    stem = re.sub(r"_part\d+$", "", Path(video).stem.lower())
     for suffix, camera_id in CAMERA_SUFFIXES:
         if stem.endswith(suffix):
             return camera_id
     raise ValueError(
         f"无法判断视频对应的四目相机: {Path(video).name}；"
-        "文件名须以 camera_left、camera_right、camera_right_side 或 camera_left_side 结尾")
+        "文件名须以 camera_left、camera_right、camera_right_side 或 camera_left_side "
+        "结尾，可附加 _part0001 等分段编号")
 
 
 def calibration_for_video(video: Path, override: Path | None = None) -> Path:

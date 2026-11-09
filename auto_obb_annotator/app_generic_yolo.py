@@ -106,6 +106,7 @@ class GenericYOLOThread(GenericThread):
                         self.config["target_count"],
                         self.config.get("review_reasons"),
                         self.config.get("selection_rule"),
+                        self.config.get("review_score"),
                     )
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])

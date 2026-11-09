@@ -145,6 +145,41 @@ class GrayGloveVideoTests(unittest.TestCase):
         self.assertEqual(side["camera_id"], "cam_2")
         self.assertIn("侧视相机", side["reason"])
 
+    def test_side_camera_uses_sam_evidence_without_screen_side_guess(self):
+        glove = {"class_id": 1, "score": 0.93,
+                 "polygon": [[140, 50], [180, 50], [180, 90], [140, 90]]}
+        record = {"status": "auto", "reason": "自动候选", "objects": [glove],
+                  "candidates": [], "candidate_count": 1}
+        evidence = [{"class_id": 0, "score": 0.85, "box": [140, 10, 180, 50]},
+                    {"class_id": 1, "score": 0.74, "box": [140, 10, 180, 50]}]
+        scored = ui.attach_side_scores(record, evidence, (0, 40))
+        left = ui.assign_glove_sides(scored, 200, "screen", "cam_3")
+        left = ui.flag_side_camera_review(left, "cam_3")
+        self.assertEqual(left["objects"][0]["class_id"], 0)
+        self.assertFalse(left["side_pending"])
+        self.assertTrue(left["side_autoclassified"])
+        self.assertEqual(left["status"], "auto")
+        conflicting = ui.attach_side_scores(record, [
+            {"class_id": 0, "score": 0.70, "box": [140, 10, 180, 50]},
+            {"class_id": 1, "score": 0.86, "box": [140, 10, 180, 50]},
+        ], (0, 40))
+        uncertain = ui.assign_glove_sides(conflicting, 200, "screen", "cam_3")
+        self.assertTrue(uncertain["side_pending"])
+        self.assertEqual(uncertain["status"], "review")
+
+    def test_side_camera_pair_auto_when_both_prompts_agree(self):
+        record = {"status": "auto", "reason": "自动候选", "objects": [
+            {"class_id": 0, "polygon": [[20, 50], [50, 50], [50, 90], [20, 90]],
+             "side_scores": [0.90, 0.59]},
+            {"class_id": 0, "polygon": [[140, 50], [180, 50], [180, 90], [140, 90]],
+             "side_scores": [0.70, 0.88]},
+        ], "candidates": [], "candidate_count": 2}
+        result = ui.flag_side_camera_review(
+            ui.assign_glove_sides(record, 200, camera_id="cam_2"), "cam_2")
+        self.assertEqual([item["class_id"] for item in result["objects"]], [0, 1])
+        self.assertTrue(result["side_autoclassified"])
+        self.assertEqual(result["status"], "auto")
+
 
 class GrayGloveUITests(unittest.TestCase):
     @classmethod
@@ -176,11 +211,14 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(self.window.count_combo.currentData(), "fixed")
         self.assertEqual(self.window.count_spin.value(), 2)
         self.assertEqual(self.window.selection_combo.currentData(), "area")
+        self.assertEqual(self.window.confidence_spin.value(), 0.40)
+        self.assertEqual(self.window.review_score_spin.value(), 0.50)
         self.assertEqual(self.window.format_combo.currentData(), "hbb")
         self.assertEqual(self.window.output_edit.text(), str(self.output))
         self.assertIsInstance(self.window.centralWidget(), QScrollArea)
         self.assertFalse(self.window.class_table.isEnabled())
         self.assertEqual(self.window.side_combo.currentData(), "screen")
+        self.assertTrue(self.window.auto_side_check.isChecked())
         self.window.interval_mode.setCurrentIndex(
             self.window.interval_mode.findData("frames"))
         self.assertEqual(self.window.interval_spin.value(), 30)
@@ -214,6 +252,20 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(config["prompt_ensemble"], list(ui.GRAY_GLOVE_PROMPTS))
         self.assertEqual(config["model_path"], str(ui.SAM3_MODEL.resolve()))
         self.assertEqual(config["side_mapping"], "screen")
+
+    def test_f5_retries_old_side_reviews_without_touching_confirmed_labels(self):
+        self.window.records = {
+            "old_side.jpg": {"camera_id": "cam_3", "status": "review"},
+            "attempted.jpg": {"camera_id": "cam_2", "status": "review",
+                              "side_auto_attempted": True},
+            "confirmed.jpg": {"camera_id": "cam_3", "status": "confirmed"},
+        }
+        thread = self.window.make_detection_thread([], {}, set(self.window.records))
+        self.assertEqual(thread.done_names, {"attempted.jpg", "confirmed.jpg"})
+        self.assertTrue(thread.config["auto_side"])
+        self.window.auto_side_check.setChecked(False)
+        conservative = self.window.make_detection_thread([], {}, set(self.window.records))
+        self.assertEqual(conservative.done_names, set(self.window.records))
 
     def test_video_import_updates_image_directory_and_random_sample(self):
         video = self.root / "gloves.mp4"
@@ -304,6 +356,19 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(run.call_args.args[-1], list(ui.GRAY_GLOVE_PROMPTS))
         self.assertEqual([item["class_id"] for item in result], [0, 0, 0])
 
+    def test_directional_prompts_are_kept_as_evidence_not_extra_gloves(self):
+        fake = [{"class_id": index, "box": [0, 0, 20, 20], "score": 0.9}
+                for index in range(5)]
+        with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=fake) as run:
+            segmenter = ui.GrayGloveSegmenter.__new__(ui.GrayGloveSegmenter)
+            segmenter.side_prompts_enabled = True
+            result = segmenter.detect_many(None, [])
+        self.assertEqual(run.call_args.args[-1],
+                         list(ui.GRAY_GLOVE_PROMPTS) + list(ui.SIDE_GLOVE_PROMPTS))
+        self.assertEqual(len(result), 3)
+        self.assertEqual([item["class_id"] for item in segmenter.last_side_detections],
+                         [0, 1])
+
     def test_single_hand_requires_explicit_side_and_focus_view_is_larger(self):
         source = self.root / "images"
         source.mkdir()
@@ -317,16 +382,26 @@ class GrayGloveUITests(unittest.TestCase):
                          "polygon": [[140, 50], [180, 50], [180, 90], [140, 90]]}],
             "candidates": [], "candidate_count": 1,
         }, 200)
+        record = ui.flag_side_camera_review(record, "cam_3")
         self.window.records["one.jpg"] = record
         self.window.update_table(record)
         self.window.show_record("one.jpg")
+        self.assertEqual(self.window.object_table.item(0, 1).text(), "左右待定")
+        self.assertEqual(
+            self.window.preview_pixmap.toImage().pixelColor(140, 70).getRgb()[:3],
+            (210, 90, 180))
         with patch.object(ui.QMessageBox, "information"):
             self.window.confirm_current()
         self.assertEqual(self.window.records["one.jpg"]["status"], "review")
-        self.window.assign_current_side(1)
+        self.window.assign_current_side(0)
         saved = load_records(self.output / "review.jsonl")["one.jpg"]
         self.assertEqual(saved["status"], "confirmed")
-        self.assertEqual(saved["objects"][0]["class_id"], 1)
+        self.assertEqual(saved["objects"][0]["class_id"], 0)
+        self.assertFalse(saved["side_pending"])
+        self.assertEqual(self.window.object_table.item(0, 1).text(), "left")
+        self.assertEqual(
+            self.window.preview_pixmap.toImage().pixelColor(140, 70).getRgb()[:3],
+            (0, 200, 0))
         self.window.toggle_focus_view()
         self.assertFalse(self.window.settings_group.isVisible())
         self.assertGreaterEqual(self.window.preview.minimumHeight(), 620)

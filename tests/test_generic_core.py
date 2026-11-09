@@ -6,9 +6,10 @@ import cv2
 import numpy as np
 
 from auto_obb_annotator.generic_core import (
-    detect_generic, export_generic, normalize_sample_percent,
+    detect_generic, export_generic, has_duplicate_selected_boxes,
+    normalize_sample_percent,
     normalize_sample_seed, normalize_selection_rule, sample_image_files,
-    select_detections,
+    recheck_review_scores, select_detections,
     validate_classes,
 )
 from auto_obb_annotator.generic_region import (
@@ -121,6 +122,24 @@ class GenericCoreTests(unittest.TestCase):
         self.assertEqual([item["selected"] for item in by_area["candidates"]],
                          [False, True])
 
+    def test_fixed_count_does_not_select_nested_boxes_as_two_hands(self):
+        detections = [
+            {"class_id": 1, "box": [80, 25, 180, 160], "score": 0.92},
+            {"class_id": 0, "box": [85, 50, 140, 130], "score": 0.38},
+            {"class_id": 0, "box": [20, 40, 60, 150], "score": 0.21},
+        ]
+        result = select_detections(self.image, [0, 0, 1, 1], detections,
+                                   2, "fixed", 2, selection_rule="area")
+        self.assertEqual([obj["score"] for obj in result["objects"]],
+                         [0.92, 0.21])
+        self.assertEqual([item["selected"] for item in result["candidates"]],
+                         [True, False, True])
+        self.assertEqual(result["candidate_count"], 3)
+        old_record = {"objects": [
+            {"polygon": [[80, 25], [180, 25], [180, 160], [80, 160]]},
+            {"polygon": [[85, 50], [140, 50], [140, 130], [85, 130]]}]}
+        self.assertTrue(has_duplicate_selected_boxes(old_record))
+
     def test_all_mode_keeps_every_distinct_candidate(self):
         result = select_detections(self.image, self.roi, self.detections, 2, "all", 1)
         self.assertEqual(len(result["objects"]), 3)
@@ -147,17 +166,35 @@ class GenericCoreTests(unittest.TestCase):
         self.assertIn("边缘", default["reason"])
         self.assertEqual(ignored["status"], "auto")
         self.assertIn("已关闭", ignored["reason"])
-        low = [{**near_edge[0], "score": 0.65}]
+        low = [{**near_edge[0], "score": 0.45}]
         low_only = select_detections(self.image, self.roi, low, 2,
                                      "all", 1, ["low_score"])
         self.assertEqual(low_only["status"], "review")
         self.assertIn("低置信度", low_only["reason"])
+        self.assertIn("0.50", low_only["reason"])
+        adjusted = select_detections(self.image, self.roi,
+                                     [{**near_edge[0], "score": 0.65}],
+                                     2, "all", 1, ["low_score"],
+                                     review_score=0.70)
+        self.assertEqual(adjusted["status"], "review")
+        self.assertIn("0.70", adjusted["reason"])
         missing = select_detections(self.image, self.roi, [], 2, "all", 1, [])
         self.assertEqual(missing["status"], "auto")
         short = select_detections(self.image, self.roi, [], 2,
                                   "fixed", 2, ["short_count"])
         self.assertEqual(short["status"], "review")
         self.assertIn("少于", short["reason"])
+
+    def test_lower_review_score_keeps_unresolved_side_view_in_review(self):
+        records = {"side.jpg": {"status": "review", "camera_id": "cam_3",
+                                "reason": "存在低置信度目标，请人工检查",
+                                "objects": [{"score": 0.65}]},
+                   "confirmed.jpg": {"status": "confirmed", "objects": [
+                       {"score": 0.35}]}}
+        updated = recheck_review_scores(records, 0.50)
+        self.assertEqual(updated["side.jpg"]["status"], "review")
+        self.assertIn("左右手", updated["side.jpg"]["reason"])
+        self.assertEqual(updated["confirmed.jpg"]["status"], "confirmed")
 
     def test_circle_region_masks_crop_and_excludes_outside_candidates(self):
         circle = {"shape": "circle", "center": [0.5, 0.5], "radius": 0.3}

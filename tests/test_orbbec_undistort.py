@@ -62,9 +62,15 @@ class OrbbecUndistortTests(unittest.TestCase):
         for suffix, expected in mapping.items():
             self.assertEqual(camera_id_for_video(
                 self.session / f"EGO_camera_{suffix}.mp4"), expected)
+            self.assertEqual(camera_id_for_video(
+                self.session / f"EGO_camera_{suffix}_part0001.mp4"), expected)
+            self.assertEqual(camera_id_for_video(
+                self.session / f"EGO_camera_{suffix}_part0012.mp4"), expected)
         self.assertEqual(calibration_for_video(self.video), self.calibration)
         with self.assertRaisesRegex(ValueError, "无法判断视频"):
             camera_id_for_video(self.session / "unknown.mp4")
+        with self.assertRaisesRegex(ValueError, "无法判断视频"):
+            camera_id_for_video(self.session / "EGO_camera_left_part0001_extra.mp4")
 
     def test_only_selected_frames_are_undistorted_and_resumable(self):
         rectifier = OrbbecUndistorter([self.video])

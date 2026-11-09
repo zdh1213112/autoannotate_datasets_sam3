@@ -24,7 +24,8 @@ from .app_generic import (
     GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread,
     SELECTED_COLOR, UNSELECTED_COLOR,
 )
-from .generic_core import detect_generic
+from .generic_core import detect_generic, normalize_review_reasons
+from .generic_region import region_bounds
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
 from .gray_glove_mcap import CAMERA_TOPICS
 from .orbbec_undistort import OrbbecUndistorter
@@ -46,8 +47,11 @@ GRAY_GLOVE_PROMPTS = (
     "hand wearing a gray protective work glove",
     "hand wearing a protective work glove",
 )
+SIDE_GLOVE_PROMPTS = ("left gloved hand", "right gloved hand")
+SIDE_CAMERA_CLASS = {"cam_2": 1, "cam_3": 0}
 LEFT_LABEL_COLOR = SELECTED_COLOR
 RIGHT_LABEL_COLOR = (255, 180, 0)  # cyan blue in BGR
+PENDING_SIDE_COLOR = (180, 90, 210)  # purple in BGR
 WORKFLOW = "gray_glove_lr_v2"
 
 
@@ -55,13 +59,41 @@ def _center_x(polygon) -> float:
     return float(np.asarray(polygon, dtype=np.float32).reshape(4, 2)[:, 0].mean())
 
 
-def assign_glove_sides(record: dict, width: int, mapping: str = "screen") -> dict:
-    """Apply the prior screen/mirror convention to a pair of glove boxes.
+def _box_iou(first, second) -> float:
+    xa, ya = max(first[0], second[0]), max(first[1], second[1])
+    xb, yb = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0.0, xb - xa) * max(0.0, yb - ya)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
 
-    A lone glove gets a visual suggestion but remains pending until a person
-    explicitly assigns left or right. This avoids positional guesses for a
-    hand that crosses the image center.
-    """
+
+def attach_side_scores(record: dict, side_detections: list[dict],
+                       offset: tuple[int, int]) -> dict:
+    """Attach directional SAM3 scores to each selected glove by box overlap."""
+    result = {**record, "objects": [dict(obj) for obj in record.get("objects", [])]}
+    for obj in result["objects"]:
+        polygon = np.asarray(obj["polygon"], dtype=np.float32)
+        lower, upper = polygon.min(axis=0), polygon.max(axis=0)
+        box = (lower[0], lower[1], upper[0], upper[1])
+        scores = [0.0, 0.0]
+        for detection in side_detections:
+            class_id = int(detection["class_id"])
+            if class_id not in (0, 1):
+                continue
+            x1, y1, x2, y2 = detection["box"]
+            shifted = (x1 + offset[0], y1 + offset[1],
+                       x2 + offset[0], y2 + offset[1])
+            if _box_iou(box, shifted) >= 0.35:
+                scores[class_id] = max(scores[class_id], float(detection["score"]))
+        obj["side_scores"] = [round(score, 4) for score in scores]
+    return result
+
+
+def assign_glove_sides(record: dict, width: int, mapping: str = "screen",
+                       camera_id: str | None = None) -> dict:
+    """Assign sides from image position, corroborated by SAM3 on side cameras."""
     if mapping not in {"screen", "mirror"}:
         raise ValueError(f"未知左右手映射方式: {mapping}")
     result = {**record, "objects": [dict(obj) for obj in record.get("objects", [])],
@@ -75,11 +107,31 @@ def assign_glove_sides(record: dict, width: int, mapping: str = "screen") -> dic
         if abs(_center_x(ordered[0]["polygon"]) -
                _center_x(ordered[1]["polygon"])) < width * 0.05:
             result.update(status="review", reason="两只手套位置靠近，请人工核对左右类别")
+        if (camera_id in SIDE_CAMERA_CLASS and
+                abs(_center_x(ordered[0]["polygon"]) -
+                    _center_x(ordered[1]["polygon"])) >= width * 0.08):
+            votes_agree = all(
+                obj.get("side_scores", [0, 0])[obj["class_id"]] >= 0.70 and
+                obj.get("side_scores", [0, 0])[obj["class_id"]] -
+                obj.get("side_scores", [0, 0])[1 - obj["class_id"]] >= 0.08
+                for obj in objects)
+            result["side_autoclassified"] = votes_agree
     elif len(objects) == 1:
         suggested = int(_center_x(objects[0]["polygon"]) >= width / 2)
         objects[0]["class_id"] = suggested if mapping == "screen" else 1 - suggested
-        result.update(side_pending=True, status="review",
-                      reason="单手左右未定：请按 Alt+1 或 Alt+2 明确指定")
+        prior = SIDE_CAMERA_CLASS.get(camera_id)
+        scores = objects[0].get("side_scores", [0.0, 0.0])
+        if (prior is not None and scores[prior] >= 0.65 and
+                scores[prior] - scores[1 - prior] >= 0.01):
+            objects[0]["class_id"] = prior
+            result["side_pending"] = False
+            result["side_autoclassified"] = True
+            if result.get("status") == "auto":
+                result["reason"] = (f"侧视单手：SAM3 与 {camera_id} 相机方向一致，"
+                                    f"自动标为 {'left' if prior == 0 else 'right'}")
+        else:
+            result.update(side_pending=True, status="review",
+                          reason="单手左右未定：请按 Alt+1 或 Alt+2 明确指定")
     elif len(objects) > 2:
         result.update(side_pending=True, status="review",
                       reason="超过两只手套，请删除误检并核对左右类别")
@@ -102,14 +154,15 @@ def _update_candidate_sides(record: dict, width: int, mapping: str):
 
 
 def flag_side_camera_review(record: dict, camera_id: str | None) -> dict:
-    """Side views need a person to confirm physical left/right identity."""
+    """Review side views when directional evidence did not settle handedness."""
     if camera_id is None:
         return record
     result = {**record, "camera_id": camera_id}
-    if (camera_id in {"cam_2", "cam_3"} and result.get("objects")
+    if (camera_id in SIDE_CAMERA_CLASS and result.get("objects")
+            and not result.get("side_autoclassified")
             and result.get("status") == "auto"):
         result["status"] = "review"
-        result["reason"] = "侧视相机的左右手仅按画面位置建议，请人工确认"
+        result["reason"] = "侧视相机的左右提示词证据不足或冲突，请人工确认"
     return result
 
 
@@ -165,11 +218,18 @@ class LargePreviewDialog(QDialog):
 
 
 class GrayGloveSegmenter(GenericSAM3Segmenter):
-    """Merge several glove descriptions before assigning left/right labels."""
+    """Locate gloves and optionally query SAM3 for left/right evidence."""
 
     def detect_many(self, image_bgr, _prompts):
-        detections = super().detect_many(image_bgr, list(GRAY_GLOVE_PROMPTS))
-        return [{**detection, "class_id": 0} for detection in detections]
+        prompts = list(GRAY_GLOVE_PROMPTS)
+        if getattr(self, "side_prompts_enabled", False):
+            prompts.extend(SIDE_GLOVE_PROMPTS)
+        detections = super().detect_many(image_bgr, prompts)
+        self.last_side_detections = [
+            {**item, "class_id": int(item["class_id"]) - len(GRAY_GLOVE_PROMPTS)}
+            for item in detections if int(item["class_id"]) >= len(GRAY_GLOVE_PROMPTS)]
+        return [{**item, "class_id": 0} for item in detections
+                if int(item["class_id"]) < len(GRAY_GLOVE_PROMPTS)]
 
 
 class GrayGloveThread(GenericThread):
@@ -199,17 +259,34 @@ class GrayGloveThread(GenericThread):
                     image = cv2.imread(str(path))
                     if image is None:
                         raise ValueError("图片无法解码")
+                    camera_id = camera_ids.get(path.name)
+                    auto_side = (self.config.get("auto_side", True)
+                                 and camera_id in SIDE_CAMERA_CLASS)
+                    self.segmenter.side_prompts_enabled = auto_side
+                    review_reasons = normalize_review_reasons(
+                        self.config.get("review_reasons"))
+                    if auto_side:
+                        review_reasons = [reason for reason in review_reasons
+                                          if reason != "short_count"]
                     result = detect_generic(
                         image, self.config["roi"], self.segmenter,
                         self.config["classes"], self.config["count_mode"],
                         self.config["target_count"],
-                        self.config.get("review_reasons"),
-                        self.config.get("selection_rule"))
+                        review_reasons,
+                        self.config.get("selection_rule"),
+                        self.config.get("review_score"))
+                    if auto_side:
+                        x1, y1, _x2, _y2 = region_bounds(
+                            self.config["roi"], image.shape[1], image.shape[0])
+                        result = attach_side_scores(
+                            result, self.segmenter.last_side_detections, (x1, y1))
+                        result["side_auto_attempted"] = True
                     result = assign_glove_sides(
                         result, image.shape[1],
-                        self.config.get("side_mapping", "screen"))
+                        self.config.get("side_mapping", "screen"),
+                        camera_id if auto_side else None)
                     result = flag_side_camera_review(
-                        result, camera_ids.get(path.name))
+                        result, camera_id)
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])
                 except Exception as exc:
@@ -288,9 +365,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.class_table.setHorizontalHeaderLabels(["导出类别", "历史提示词"])
         self.class_table.setColumnHidden(1, True)
         self.class_table.setToolTip(
-            "固定输出 left/right 两类；左/右提示词不参与检测。"
-            "模型实际检索这三条不区分左右的手套提示词：\n" +
-            "\n".join(GRAY_GLOVE_PROMPTS))
+            "固定输出 left/right 两类；基础定位使用三条不区分左右的手套提示词。"
+            "勾选侧视自动分类时，另使用 left gloved hand / right gloved hand 辅助判断。")
         self.settings_group = self.centralWidget().layout().itemAt(0).widget()
         self.side_combo = QComboBox()
         self.side_combo.addItem("画面左侧=left，右侧=right", "screen")
@@ -301,19 +377,26 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         settings_grid.addWidget(QLabel("左右手类别规则"), 8, 0)
         settings_grid.addWidget(self.side_combo, 8, 1, 1, 4)
         settings_grid.addWidget(QLabel(
-            "SAM3 只定位灰色手套；left/right 按画面位置建议，单手和侧视图需人工确认。"),
+            "SAM3 定位手套；侧视单手在左右提示词与相机方向一致时自动定类，否则待复核。"),
             9, 0, 1, 5)
+        self.auto_side_check = QCheckBox(
+            "侧视相机自动区分左右（cam_2 默认 right，cam_3 默认 left；SAM3 辅助核对）")
+        self.auto_side_check.setChecked(True)
+        self.auto_side_check.setToolTip(
+            "只在 SAM3 左右提示词与相机方向一致且分数足够时自动标注；"
+            "不同意或看不清时仍待人工复核。")
+        settings_grid.addWidget(self.auto_side_check, 10, 0, 1, 5)
         self.roi = DEFAULT_ROI.copy()
         self.show_roi()
         self.count_combo.setCurrentIndex(self.count_combo.findData("fixed"))
         self.count_spin.setValue(2)
         self.selection_combo.setCurrentIndex(self.selection_combo.findData("area"))
-        self.confidence_spin.setValue(0.20)
+        self.confidence_spin.setValue(0.40)
         self.review_reason_checks["class_conflict"].setChecked(False)
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
         self.preview_legend.setText(
-            "绿色：left 标签；青蓝色：right 标签；暗黄色：未选检测框。点击框可切换，框旁显示类别和置信度。")
+            "绿色：left；青蓝色：right；紫色：左右待定；暗黄色：未选候选框。点击框可切换，框旁显示类别和置信度。")
 
         self.video_group = QGroupBox("视频 / MCAP 抽帧：可添加录像或文件夹，完成后直接载入标注")
         video_layout = QVBoxLayout(self.video_group)
@@ -535,6 +618,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             button.setEnabled(False)
         if hasattr(self, "side_combo"):
             self.side_combo.setEnabled(enabled)
+        if hasattr(self, "auto_side_check"):
+            self.auto_side_check.setEnabled(enabled)
         if hasattr(self, "video_edit"):
             available = enabled and not (self.video_thread and self.video_thread.isRunning())
             for widget in (self.video_edit, self.video_button,
@@ -551,6 +636,14 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.end_spin.setEnabled(available and self.end_check.isChecked())
 
     def make_detection_thread(self, files, config, done_names):
+        config = {**config, "auto_side": self.auto_side_check.isChecked()}
+        if config["auto_side"]:
+            done_names = set(done_names) - {
+                name for name, record in self.records.items()
+                if (record.get("camera_id") in SIDE_CAMERA_CLASS and
+                    record.get("status") == "review" and
+                    not record.get("side_auto_attempted"))
+            }
         return GrayGloveThread(files, config, done_names, self.segmenter)
 
     def apply_filter(self, *_args):
@@ -642,11 +735,19 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         super().clear_all_labels()
         self.apply_filter()
 
-    def color_for_candidate(self, candidate: dict) -> tuple[int, int, int]:
+    def color_for_candidate(self, candidate: dict, record: dict) -> tuple[int, int, int]:
         if not candidate["selected"]:
             return UNSELECTED_COLOR
+        if record.get("side_pending"):
+            return PENDING_SIDE_COLOR
         return (RIGHT_LABEL_COLOR if int(candidate["class_id"]) == 1
                 else LEFT_LABEL_COLOR)
+
+    def display_class_name(self, class_id: int, record: dict,
+                           selected: bool = True) -> str:
+        if record.get("side_pending"):
+            return "左右待定" if selected else "手套候选"
+        return super().display_class_name(class_id, record, selected)
 
     def show_record(self, name):
         super().show_record(name)
