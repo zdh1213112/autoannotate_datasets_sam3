@@ -24,7 +24,7 @@ from .app_generic import (
     GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread,
     SELECTED_COLOR, UNSELECTED_COLOR,
 )
-from .barcode_core import image_files
+from .barcode_core import image_files, load_records
 from .generic_core import detect_generic, normalize_review_reasons, sample_image_files
 from .generic_region import region_bounds
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
@@ -50,6 +50,21 @@ LEFT_LABEL_COLOR = SELECTED_COLOR
 RIGHT_LABEL_COLOR = (255, 180, 0)  # cyan blue in BGR
 PENDING_SIDE_COLOR = (180, 90, 210)  # purple in BGR
 WORKFLOW = "gray_glove_lr_v2"
+GLOVE_SELECTION_VERSION = 1
+DEFAULT_CONFIDENCE = 0.50
+
+
+def normalize_glove_config(config: dict) -> dict:
+    """Migrate old permissive defaults and enforce the two-glove limit."""
+    result = {**config, "count_mode": "fixed",
+              "target_count": (2 if config.get("count_mode") == "all" else
+                               max(1, min(2, int(config.get("target_count", 2))))),
+              "glove_selection_version": GLOVE_SELECTION_VERSION}
+    if config.get("glove_selection_version", 0) < GLOVE_SELECTION_VERSION:
+        result["confidence"] = max(DEFAULT_CONFIDENCE,
+                                   float(config.get("confidence", DEFAULT_CONFIDENCE)))
+        result["selection_rule"] = "confidence"
+    return result
 
 
 def _center_x(polygon) -> float:
@@ -226,12 +241,14 @@ class GrayGloveSegmenter(GenericSAM3Segmenter):
             {**item, "class_id": int(item["class_id"]) - len(GRAY_GLOVE_PROMPTS)}
             for item in detections if int(item["class_id"]) >= len(GRAY_GLOVE_PROMPTS)]
         return [{**item, "class_id": 0} for item in detections
-                if int(item["class_id"]) < len(GRAY_GLOVE_PROMPTS)]
+                if int(item["class_id"]) < len(GRAY_GLOVE_PROMPTS)
+                and float(item["score"]) >= self.conf]
 
 
 class GrayGloveThread(GenericThread):
     def run(self):
         try:
+            self.config = normalize_glove_config(self.config)
             todo = [path for path in self.files if path.name not in self.done_names]
             camera_ids = frame_camera_ids(Path(self.config["source_dir"]))
             total = len(self.files)
@@ -388,15 +405,19 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         settings_grid.addWidget(self.auto_side_check, 10, 0, 1, 5)
         self.roi = DEFAULT_ROI.copy()
         self.show_roi()
+        self.count_combo.removeItem(self.count_combo.findData("all"))
         self.count_combo.setCurrentIndex(self.count_combo.findData("fixed"))
+        self.count_combo.setItemText(0, "每张最多选取（允许单手）")
+        self.count_combo.setToolTip("每张自动选取最多 1 或 2 只手套；不会补足数量。")
+        self.count_spin.setRange(1, 2)
         self.count_spin.setValue(2)
-        self.selection_combo.setCurrentIndex(self.selection_combo.findData("area"))
-        self.confidence_spin.setValue(0.40)
+        self.selection_combo.setCurrentIndex(self.selection_combo.findData("confidence"))
+        self.confidence_spin.setValue(DEFAULT_CONFIDENCE)
         self.review_reason_checks["class_conflict"].setChecked(False)
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
         self.preview_legend.setText(
-            "绿色：left；青蓝色：right；紫色：左右待定；暗黄色：未选候选框。点击框可切换，框旁显示类别和置信度。")
+            "绿色：left；青蓝色：right；紫色：左右待定。勾选显示未选候选框后，暗黄色框可点击补选。")
 
         self.video_group = QGroupBox("输入与抽帧：图片目录或视频 / MCAP 任选一种")
         video_layout = QVBoxLayout(self.video_group)
@@ -552,6 +573,10 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.large_preview_shortcut = QShortcut(QKeySequence("Alt+Z"), self)
         self.large_preview_shortcut.setContext(Qt.WindowShortcut)
         self.large_preview_shortcut.activated.connect(self.large_preview_button.click)
+        self.show_candidates_check = QCheckBox("显示未选候选框（暗黄色，可点击补选）")
+        self.show_candidates_check.setToolTip("仅影响预览和点击，不改变标签或候选记录。")
+        self.show_candidates_check.toggled.connect(self.redraw_current_record)
+        self.preview.parentWidget().layout().insertWidget(4, self.show_candidates_check)
         side_row = QHBoxLayout()
         side_row.addWidget(QLabel("单手类别确认 / 双手交换："))
         self.side_left_button = QPushButton("设为 left [Alt+1]")
@@ -562,7 +587,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.swap_button.clicked.connect(self.swap_current_sides)
         for button in (self.side_left_button, self.side_right_button, self.swap_button):
             side_row.addWidget(button)
-        self.preview.parentWidget().layout().insertLayout(5, side_row)
+        self.preview.parentWidget().layout().insertLayout(6, side_row)
         for key, button in (("Alt+1", self.side_left_button),
                             ("Alt+2", self.side_right_button),
                             ("Alt+X", self.swap_button),
@@ -596,7 +621,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if (not self.is_extracted_video_source(Path(config["source_dir"]))
                 and self.image_interval_spin.value() != 1):
             config["image_sampling"] = self.image_sampling_settings()
-        return config
+        config["glove_selection_version"] = GLOVE_SELECTION_VERSION
+        return normalize_glove_config(config)
 
     def image_sampling_settings(self):
         return {"interval": self.image_interval_spin.value()}
@@ -651,11 +677,20 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.sync_video_sources()
         if path.is_file():
             previous = json.loads(path.read_text(encoding="utf-8"))
+            normalized = normalize_glove_config(previous)
+            self.count_combo.setCurrentIndex(self.count_combo.findData("fixed"))
+            self.count_spin.setValue(normalized["target_count"])
+            self.confidence_spin.setValue(normalized["confidence"])
+            self.selection_combo.setCurrentIndex(
+                self.selection_combo.findData(normalized["selection_rule"]))
             self.side_combo.setCurrentIndex(
                 self.side_combo.findData(previous.get("side_mapping", "screen")))
             settings = previous.get("image_sampling")
             self.image_interval_spin.setValue(settings["interval"] if settings else 1)
             self.update_sample_summary()
+            if normalized != previous:
+                self.status.setText(
+                    "旧项目已调整为最多两只手套、按置信度选框；按 F5 备份并重检自动结果，保留人工确认。")
         self.set_classes(GRAY_GLOVE_CLASSES)
         self.set_config_controls(True)
 
@@ -666,6 +701,22 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             if previous.get("workflow") != WORKFLOW:
                 raise ValueError("结果目录属于其他标注任务，请另选目录")
         return super().ensure_project(allow_reconfigure=allow_reconfigure)
+
+    def records_after_config_change(self, files, previous, config):
+        updated = super().records_after_config_change(files, previous, config)
+        if Path(previous["source_dir"]).resolve() == Path(config["source_dir"]).resolve():
+            for name, record in load_records(self.output_dir() / "review.jsonl").items():
+                if name in updated and record.get("status") in {"confirmed", "empty_confirmed"}:
+                    updated[name] = record
+        return updated
+
+    def apply_sampling(self, files, sampled, percent):
+        # A new sampling fraction must not erase a manual review decision.
+        selected_names = {path.name for path in sampled}
+        manual = [path for path in files if path.name not in selected_names and
+                  self.records.get(path.name, {}).get("status") in
+                  {"confirmed", "empty_confirmed"}]
+        super().apply_sampling(files, [*sampled, *manual], percent)
 
     def set_config_controls(self, enabled):
         super().set_config_controls(enabled)
@@ -699,6 +750,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
     def make_detection_thread(self, files, config, done_names):
         config = {**config, "auto_side": self.auto_side_check.isChecked()}
+        done_names = set(done_names) - {
+            name for name, record in self.records.items()
+            if len(record.get("objects", [])) > 2 and
+            record.get("status") not in {"confirmed", "empty_confirmed"}
+        }
         if config["auto_side"]:
             done_names = set(done_names) - {
                 name for name, record in self.records.items()
@@ -818,6 +874,13 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             return PENDING_SIDE_COLOR
         return (RIGHT_LABEL_COLOR if int(candidate["class_id"]) == 1
                 else LEFT_LABEL_COLOR)
+
+    def candidate_is_visible(self, candidate: dict, record: dict) -> bool:
+        return bool(candidate["selected"] or self.show_candidates_check.isChecked())
+
+    def redraw_current_record(self):
+        if self.current_name is not None:
+            self.show_record(self.current_name)
 
     def display_class_name(self, class_id: int, record: dict,
                            selected: bool = True) -> str:

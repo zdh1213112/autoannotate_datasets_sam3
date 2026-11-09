@@ -718,12 +718,7 @@ class GenericAnnotatorApp(QMainWindow):
                 if not files:
                     raise ValueError("图片目录为空，无法按新配置继续检测")
                 backup = backup_project(output)
-                updated = {
-                    image.name: {"name": image.name, "objects": [], "candidates": [],
-                                 "candidate_count": 0, "status": "unlabeled",
-                                 "reason": "项目配置已更新，等待重新自动检测"}
-                    for image in files
-                }
+                updated = self.records_after_config_change(files, previous, config)
                 review_path = output / "review.jsonl"
                 try:
                     replace_review_records(review_path, updated)
@@ -760,6 +755,14 @@ class GenericAnnotatorApp(QMainWindow):
         self.refresh_object_classes()
         self.set_config_controls(not (self.thread and self.thread.isRunning()))
         return config
+
+    def records_after_config_change(self, files, previous, config):
+        return {
+            image.name: {"name": image.name, "objects": [], "candidates": [],
+                         "candidate_count": 0, "status": "unlabeled",
+                         "reason": "项目配置已更新，等待重新自动检测"}
+            for image in files
+        }
 
     def apply_sampling(self, files: list[Path], sampled: list[Path], percent: int):
         """Persist exclusions so resume and review display the same image selection."""
@@ -929,6 +932,9 @@ class GenericAnnotatorApp(QMainWindow):
     def color_for_candidate(self, candidate: dict, record: dict) -> tuple[int, int, int]:
         return SELECTED_COLOR if candidate["selected"] else UNSELECTED_COLOR
 
+    def candidate_is_visible(self, candidate: dict, record: dict) -> bool:
+        return True
+
     def display_class_name(self, class_id: int, record: dict,
                            selected: bool = True) -> str:
         return self.active_config["classes"][class_id]["name"]
@@ -954,6 +960,8 @@ class GenericAnnotatorApp(QMainWindow):
         captions = []
         for candidate in sorted(display_record["candidates"],
                                 key=lambda item: bool(item["selected"])):
+            if not self.candidate_is_visible(candidate, record):
+                continue
             class_id = int(candidate["class_id"])
             color = self.color_for_candidate(candidate, record)
             points = np.rint(candidate["polygon"]).astype(np.int32)
@@ -1005,6 +1013,8 @@ class GenericAnnotatorApp(QMainWindow):
         record = sync_candidates(self.records[self.current_name])
         hits = []
         for index, candidate in enumerate(record["candidates"]):
+            if not self.candidate_is_visible(candidate, record):
+                continue
             polygon = np.asarray(candidate["polygon"], dtype=np.float32)
             if (polygon.shape == (4, 2) and
                     cv2.pointPolygonTest(polygon, (float(x), float(y)), False) >= 0):

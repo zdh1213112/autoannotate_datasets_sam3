@@ -180,6 +180,71 @@ class GrayGloveVideoTests(unittest.TestCase):
         self.assertTrue(result["side_autoclassified"])
         self.assertEqual(result["status"], "auto")
 
+    def test_old_selection_config_migrates_but_new_custom_threshold_is_kept(self):
+        old = {"count_mode": "fixed", "target_count": 3,
+               "confidence": 0.20, "selection_rule": "area"}
+        migrated = ui.normalize_glove_config(old)
+        self.assertEqual(old["target_count"], 3)
+        self.assertEqual(migrated["target_count"], 2)
+        self.assertEqual(migrated["confidence"], 0.50)
+        self.assertEqual(migrated["selection_rule"], "confidence")
+        self.assertEqual(ui.normalize_glove_config({**old, "count_mode": "all"})
+                         ["count_mode"], "fixed")
+        custom = {**migrated, "target_count": 1, "confidence": 0.30,
+                  "selection_rule": "area"}
+        self.assertEqual(ui.normalize_glove_config(custom), custom)
+
+    def test_thread_rejects_low_score_background_and_keeps_uncertain_single_hand(self):
+        # Reproduce the screenshot: three prompts agree on the glove; the
+        # chair/garment predictions score 0.487 and below. No GPU is needed.
+        source = self.root / "images"
+        source.mkdir()
+        image = source / "frame.jpg"
+        cv2.imwrite(str(image), np.zeros((120, 192, 3), np.uint8))
+        segmenter = ui.GrayGloveSegmenter.__new__(ui.GrayGloveSegmenter)
+        segmenter.device = "cpu"
+        detections = [
+            {"class_id": index, "box": [92, 78, 107, 90], "score": score}
+            for index, score in enumerate([0.8179, 0.7556, 0.5539])
+        ] + [
+            {"class_id": 0, "box": [21, 59, 69, 101], "score": 0.4870},
+            {"class_id": 1, "box": [30, 62, 69, 102], "score": 0.3831},
+            {"class_id": 2, "box": [33, 63, 59, 73], "score": 0.2536},
+            {"class_id": 3, "box": [92, 78, 107, 90], "score": 0.5915},
+            {"class_id": 4, "box": [92, 78, 107, 90], "score": 0.6127},
+        ]
+        config = {"source_dir": str(source), "roi": [0, 0, 1, 1],
+                  "classes": ui.GRAY_GLOVE_CLASSES, "count_mode": "all",
+                  "target_count": 3, "confidence": 0.20, "auto_side": True,
+                  "review_reasons": ["missing", "short_count", "low_score"]}
+        thread = ui.GrayGloveThread([image], config, set(), segmenter)
+        results, messages = [], []
+        thread.result_signal.connect(results.append)
+        thread.message_signal.connect(messages.append)
+        with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=detections), \
+                patch.object(ui, "frame_camera_ids", return_value={image.name: "cam_3"}), \
+                patch.object(ui.torch.cuda, "is_available", return_value=False):
+            thread.run()
+        self.assertEqual(len(results), 1, messages)
+        record = results[0]
+        self.assertEqual([obj["score"] for obj in record["objects"]], [0.8179])
+        self.assertEqual(record["candidate_count"], 3)
+        self.assertEqual(record["status"], "review")
+        self.assertTrue(record["side_pending"])
+        self.assertIn("单手左右未定", record["reason"])
+
+        # Consistent directional evidence can still pass a single side-view
+        # glove automatically; a second glove must not be invented.
+        detections[-2]["score"] = 0.80
+        results.clear()
+        with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=detections), \
+                patch.object(ui, "frame_camera_ids", return_value={image.name: "cam_3"}), \
+                patch.object(ui.torch.cuda, "is_available", return_value=False):
+            thread.run()
+        self.assertEqual(len(results[0]["objects"]), 1)
+        self.assertEqual(results[0]["status"], "auto")
+        self.assertTrue(results[0]["side_autoclassified"])
+
 
 class GrayGloveUITests(unittest.TestCase):
     @classmethod
@@ -210,8 +275,11 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(self.window.roi, ui.DEFAULT_ROI)
         self.assertEqual(self.window.count_combo.currentData(), "fixed")
         self.assertEqual(self.window.count_spin.value(), 2)
-        self.assertEqual(self.window.selection_combo.currentData(), "area")
-        self.assertEqual(self.window.confidence_spin.value(), 0.40)
+        self.assertEqual(self.window.selection_combo.currentData(), "confidence")
+        self.assertEqual(self.window.confidence_spin.value(), 0.50)
+        self.assertEqual(self.window.count_spin.maximum(), 2)
+        self.assertEqual(self.window.count_combo.findData("all"), -1)
+        self.assertFalse(self.window.show_candidates_check.isChecked())
         self.assertEqual(self.window.review_score_spin.value(), 0.50)
         self.assertEqual(self.window.format_combo.currentData(), "hbb")
         self.assertEqual(self.window.output_edit.text(), str(self.output))
@@ -252,6 +320,61 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(config["prompt_ensemble"], list(ui.GRAY_GLOVE_PROMPTS))
         self.assertEqual(config["model_path"], str(ui.SAM3_MODEL.resolve()))
         self.assertEqual(config["side_mapping"], "screen")
+        self.window.confidence_spin.setValue(0.30)
+        self.assertEqual(self.window.config()["confidence"], 0.30)
+
+    def test_migration_backs_up_and_preserves_manual_reviews(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("manual.jpg", "empty.jpg", "auto.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        path = self.output / "project.json"
+        legacy = json.loads(path.read_text())
+        legacy.pop("glove_selection_version")
+        legacy.update(target_count=3, confidence=0.20, selection_rule="area")
+        path.write_text(json.dumps(legacy))
+        records = [
+            {"name": "manual.jpg", "status": "confirmed", "objects": [
+                {"class_id": 0, "score": 1.0,
+                 "polygon": [[20, 50], [50, 50], [50, 90], [20, 90]]}]},
+            {"name": "empty.jpg", "status": "empty_confirmed", "objects": []},
+            {"name": "auto.jpg", "status": "review", "objects": []},
+        ]
+        for record in records:
+            append_record(self.output / "review.jsonl", record)
+        self.window.load_project()
+        self.assertEqual(self.window.count_spin.value(), 2)
+        self.assertEqual(self.window.confidence_spin.value(), 0.50)
+        self.assertEqual(self.window.selection_combo.currentData(), "confidence")
+        self.assertEqual(json.loads(path.read_text()), legacy)
+        self.window.ensure_project(allow_reconfigure=True)
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["manual.jpg"], records[0])
+        self.assertEqual(saved["empty.jpg"], records[1])
+        self.assertEqual(saved["auto.jpg"]["status"], "unlabeled")
+        backup = next(self.output.glob("backup_before_config_*"))
+        self.assertEqual(json.loads((backup / "project.json").read_text()), legacy)
+        self.assertEqual(load_records(backup / "review.jsonl")["manual.jpg"], records[0])
+        self.window.apply_sampling(list(source.glob("*.jpg")), [source / "auto.jpg"], 50)
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["manual.jpg"], records[0])
+        self.assertEqual(saved["empty.jpg"], records[1])
+
+    def test_changing_source_does_not_transfer_manual_labels_by_filename(self):
+        for folder in ("first", "second"):
+            source = self.root / folder
+            source.mkdir()
+            cv2.imwrite(str(source / "one.jpg"), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(self.root / "first"))
+        self.window.ensure_project()
+        append_record(self.output / "review.jsonl", {
+            "name": "one.jpg", "status": "empty_confirmed", "objects": []})
+        self.window.input_edit.setText(str(self.root / "second"))
+        self.window.ensure_project(allow_reconfigure=True)
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["one.jpg"]["status"], "unlabeled")
 
     def test_f5_retries_old_side_reviews_without_touching_confirmed_labels(self):
         self.window.records = {
@@ -486,6 +609,7 @@ class GrayGloveUITests(unittest.TestCase):
                 for index in range(3)]
         with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=fake) as run:
             segmenter = ui.GrayGloveSegmenter.__new__(ui.GrayGloveSegmenter)
+            segmenter.conf = 0.50
             result = segmenter.detect_many(None, [])
         self.assertEqual(run.call_args.args[-1], list(ui.GRAY_GLOVE_PROMPTS))
         self.assertEqual([item["class_id"] for item in result], [0, 0, 0])
@@ -495,6 +619,7 @@ class GrayGloveUITests(unittest.TestCase):
                 for index in range(5)]
         with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=fake) as run:
             segmenter = ui.GrayGloveSegmenter.__new__(ui.GrayGloveSegmenter)
+            segmenter.conf = 0.50
             segmenter.side_prompts_enabled = True
             result = segmenter.detect_many(None, [])
         self.assertEqual(run.call_args.args[-1],
@@ -575,11 +700,25 @@ class GrayGloveUITests(unittest.TestCase):
 
         self.assertEqual(pixel(20), (0, 200, 0))
         self.assertEqual(pixel(120), (0, 180, 255))
+        self.assertEqual(pixel(170), (0, 0, 0))
+        # Invisible candidates must not react to clicks or change the record.
+        self.window.toggle_candidate_at(180, 75)
+        self.assertEqual(self.window.records["both.jpg"], record)
+        self.window.show_candidates_check.setChecked(True)
         self.assertEqual(pixel(170), (184, 134, 11))
         self.window.swap_current_sides()
         self.assertEqual(pixel(20), (0, 180, 255))
         self.assertEqual(pixel(120), (0, 200, 0))
         self.assertEqual(pixel(170), (184, 134, 11))
+
+        # Showing a candidate makes it selectable; hiding it later must keep
+        # selected labels visible and preserve their original candidate IDs.
+        self.window.toggle_candidate_at(180, 75)
+        selected = self.window.records["both.jpg"]
+        self.assertEqual([obj["candidate_id"] for obj in selected["objects"]], [0, 1, 2])
+        self.assertEqual(selected["status"], "review")
+        self.window.show_candidates_check.setChecked(False)
+        self.assertEqual(pixel(170), (210, 90, 180))
 
     def test_export_yaml_has_left_right_classes(self):
         source = self.root / "images"
