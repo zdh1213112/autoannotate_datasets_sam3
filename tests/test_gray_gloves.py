@@ -291,7 +291,8 @@ class GrayGloveUITests(unittest.TestCase):
 
     def test_gray_glove_defaults_and_independent_project(self):
         self.assertEqual(self.window.classes(), ui.GRAY_GLOVE_CLASSES)
-        self.assertEqual(self.window.roi, ui.DEFAULT_ROI)
+        self.assertEqual(self.window.roi, [0.0, 0.0, 1.0, 1.0])
+        self.assertEqual(self.window.roi_label.text(), "检测区域：整张图片")
         self.assertEqual(self.window.count_combo.currentData(), "fixed")
         self.assertEqual(self.window.count_spin.value(), 2)
         self.assertEqual(self.window.selection_combo.currentData(), "confidence")

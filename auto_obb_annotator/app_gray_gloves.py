@@ -34,7 +34,7 @@ from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
 DEFAULT_OUTPUT = ROOT_DIR / "data" / "gray_glove_lr_annotations"
-DEFAULT_ROI = [0.0, 0.42, 1.0, 1.0]
+DEFAULT_ROI = [0.0, 0.0, 1.0, 1.0]
 GRAY_GLOVE_CLASSES = [
     {"name": "left", "prompt": "left hand wearing a light gray glove"},
     {"name": "right", "prompt": "right hand wearing a light gray glove"},
