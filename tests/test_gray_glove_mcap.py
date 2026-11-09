@@ -86,6 +86,19 @@ class GrayGloveMcapTests(unittest.TestCase):
             [self.mcap], output, "seconds", 0.2,
             mcap_camera_ids=("cam_0",))[1:], (3, 3))
 
+    def test_incomplete_files_are_reported_before_batch_writes(self):
+        empty = self.root / "empty.mcap"
+        empty.touch()
+        truncated = self.root / "truncated.mcap"
+        truncated.write_bytes(self.mcap.read_bytes()[:-8])
+        output = self.root / "out"
+        with self.assertRaises(ValueError) as error:
+            extract_video_batch([self.mcap, empty, truncated], output,
+                                "seconds", 1.0, mcap_camera_ids=("cam_0",))
+        self.assertIn("empty.mcap: 文件为空或过短", str(error.exception))
+        self.assertIn("truncated.mcap: 缺少 MCAP 结束标记", str(error.exception))
+        self.assertFalse(output.exists())
+
     def test_mcap_undistortion_uses_parent_calibration(self):
         rectifier = OrbbecUndistorter([self.mcap], mcap_camera_ids=("cam_1",))
         self.assertEqual(set(rectifier.metadata), {f"{self.mcap}::/camera/right"})

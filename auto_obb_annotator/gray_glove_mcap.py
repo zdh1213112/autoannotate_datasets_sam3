@@ -17,6 +17,27 @@ CAMERA_TOPICS = {
     "cam_3": "/camera/left_side",
 }
 
+MCAP_MAGIC = b"\x89MCAP0\r\n"
+
+
+def validate_mcap_files(paths):
+    """Reject empty or incomplete recordings before creating any output."""
+    errors = []
+    for path in map(Path, paths):
+        with path.open("rb") as source:
+            if path.stat().st_size < len(MCAP_MAGIC) * 2:
+                errors.append(f"{path}: 文件为空或过短")
+                continue
+            if source.read(len(MCAP_MAGIC)) != MCAP_MAGIC:
+                errors.append(f"{path}: 缺少 MCAP 文件头")
+                continue
+            source.seek(-len(MCAP_MAGIC), 2)
+            if source.read(len(MCAP_MAGIC)) != MCAP_MAGIC:
+                errors.append(f"{path}: 缺少 MCAP 结束标记，文件可能不完整")
+    if errors:
+        raise ValueError("以下 MCAP 文件无效，请检查录像是否复制完整或重新获取：\n"
+                         + "\n".join(errors))
+
 
 def _dependencies():
     try:
@@ -48,6 +69,7 @@ def probe_mcap(path: Path, camera_ids=None) -> list[McapStream]:
     """Find the four known EGO4 image topics and their time origins."""
     _av, make_reader, _factory = _dependencies()
     path = Path(path).expanduser().resolve()
+    validate_mcap_files([path])
     wanted = set(CAMERA_TOPICS if camera_ids is None else camera_ids)
     unknown = wanted - CAMERA_TOPICS.keys()
     if unknown:

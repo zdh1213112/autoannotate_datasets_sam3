@@ -282,6 +282,138 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertTrue(Path(self.window.input_edit.text()).is_dir())
         self.assertIn("4/4", self.window.sample_summary.text())
         self.assertTrue(self.window.start_button.isEnabled())
+        self.assertFalse(self.window.video_edit.text())
+        self.assertEqual(self.window.video_list.item(0).text(), str(video))
+        for button in (self.window.video_button, self.window.folder_button,
+                       self.window.add_path_button, self.window.remove_video_button,
+                       self.window.clear_video_button):
+            self.assertFalse(button.isEnabled())
+        self.assertTrue(self.window.change_video_button.isEnabled())
+        self.window.change_video_button.click()
+        self.assertEqual(self.window.video_list.count(), 0)
+        self.assertFalse(self.window.input_edit.text())
+        self.assertTrue(self.window.video_button.isEnabled())
+        self.assertFalse(self.window.change_video_button.isEnabled())
+
+    def test_detection_accepts_one_input_source(self):
+        with patch.object(ui.QMessageBox, "warning") as warning, \
+                patch.object(ui.GenericAnnotatorApp, "start_detection") as detect:
+            self.window.start_detection()
+            self.assertIn("图片目录或添加视频", warning.call_args.args[2])
+            self.window.input_edit.setText(str(self.root / "images"))
+            self.window.video_list.addItem(str(self.root / "recording.mcap"))
+            self.window.start_detection()
+            self.assertIn("请选择一种输入", warning.call_args.args[2])
+            detect.assert_not_called()
+            self.window.video_list.clear()
+            self.window.start_detection()
+            detect.assert_called_once()
+
+    def test_video_only_detection_extracts_then_starts_detection(self):
+        video = self.root / "gloves.mp4"
+        make_video(video)
+        self.window.add_video_paths([video])
+        with patch.object(ui.GenericAnnotatorApp, "start_detection") as detect:
+            self.window.start_detection()
+            deadline = time.monotonic() + 10
+            while self.window.video_thread is not None and time.monotonic() < deadline:
+                self.qt.processEvents()
+                time.sleep(0.01)
+            self.qt.processEvents()
+            self.assertIsNone(self.window.video_thread)
+            detect.assert_called_once()
+        self.assertTrue(Path(self.window.input_edit.text()).is_dir())
+        self.assertEqual(self.window.video_list.count(), 1)
+        self.assertEqual(self.window.video_list.item(0).text(), str(video))
+
+    def test_imported_sources_restore_when_project_reopened(self):
+        video = self.root / "gloves.mp4"
+        make_video(video)
+        self.window.add_video_paths([video])
+        self.window.import_video()
+        deadline = time.monotonic() + 10
+        while self.window.video_thread is not None and time.monotonic() < deadline:
+            self.qt.processEvents()
+            time.sleep(0.01)
+        self.qt.processEvents()
+        self.assertIsNone(self.window.video_thread)
+        self.window.ensure_project()
+        self.window.video_list.clear()
+        self.window._loaded_video_folder = None
+        self.window.load_project()
+        self.assertEqual(self.window.video_list.item(0).text(), str(video))
+        self.assertFalse(self.window.clear_video_button.isEnabled())
+        with patch.object(ui.GenericAnnotatorApp, "start_detection") as detect, \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.start_detection()
+            detect.assert_called_once()
+            warning.assert_not_called()
+        self.window.input_edit.setText(str(self.root / "other_images"))
+        self.window.sync_video_sources()
+        self.assertEqual(self.window.video_list.count(), 0)
+        self.assertTrue(self.window.video_button.isEnabled())
+
+    def test_failed_video_extraction_does_not_start_detection(self):
+        video = self.root / "gloves.mp4"
+        make_video(video)
+        self.window.add_video_paths([video])
+        with patch.object(ui, "extract_video_batch", side_effect=ValueError("抽帧失败")), \
+                patch.object(ui.QMessageBox, "warning") as warning, \
+                patch.object(ui.GenericAnnotatorApp, "start_detection") as detect:
+            self.window.start_detection()
+            deadline = time.monotonic() + 10
+            while self.window.video_thread is not None and time.monotonic() < deadline:
+                self.qt.processEvents()
+                time.sleep(0.01)
+            self.qt.processEvents()
+            self.assertIsNone(self.window.video_thread)
+            warning.assert_called_once()
+            detect.assert_not_called()
+        self.assertEqual(self.window.video_list.count(), 1)
+        self.assertFalse(self.window.input_edit.text())
+
+    def test_image_interval_controls_detection_export_and_project_reload(self):
+        source = self.root / "images"
+        source.mkdir()
+        for index in range(7):
+            cv2.imwrite(str(source / f"{index:02}.jpg"), np.zeros((10, 10, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.image_interval_spin.setValue(2)
+        self.assertIn("抽帧 4/7", self.window.sample_summary.text())
+        with patch.object(self.window, "validate_model_ready"), \
+                patch.object(ui, "GrayGloveThread") as thread_class:
+            thread_class.return_value.isRunning.return_value = False
+            self.window.start_detection()
+            selected = thread_class.call_args.args[0]
+            self.assertEqual([path.name for path in selected],
+                             ["00.jpg", "02.jpg", "04.jpg", "06.jpg"])
+            self.assertEqual(self.window.records["01.jpg"]["status"], "skipped")
+            self.window.load_project()
+            self.assertEqual(self.window.image_interval_spin.value(), 2)
+            with patch("auto_obb_annotator.app_generic.export_generic",
+                       return_value=(self.output, 0, 0)) as export, \
+                    patch.object(ui.QMessageBox, "information"):
+                self.window.export()
+            self.assertEqual(export.call_args.args[-1],
+                             {"00.jpg", "02.jpg", "04.jpg", "06.jpg"})
+
+    def test_video_frames_are_not_sampled_a_second_time_as_images(self):
+        video = self.root / "gloves.mp4"
+        make_video(video)
+        self.window.image_interval_spin.setValue(3)
+        self.window.video_edit.setText(str(video))
+        self.window.interval_spin.setValue(0.5)
+        self.window.import_video()
+        deadline = time.monotonic() + 10
+        while self.window.video_thread is not None and time.monotonic() < deadline:
+            self.qt.processEvents()
+            time.sleep(0.01)
+        self.qt.processEvents()
+        self.assertIsNone(self.window.video_thread)
+        files = ui.image_files(Path(self.window.input_edit.text()))
+        self.assertEqual(len(files), 4)
+        self.assertEqual(self.window.sampling_candidates(files, self.window.config()), files)
+        self.assertIn("抽帧 4/4", self.window.sample_summary.text())
 
     def test_batch_import_appends_to_existing_video_project(self):
         legacy = self.output / "video_frames" / "legacy"
@@ -343,6 +475,8 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(self.window.output_edit.text(), str(rectified_output))
         self.assertEqual(self.window.input_edit.text(),
                          str(rectified_output / "video_frames" / "collection"))
+        self.assertEqual(self.window.video_list.item(0).text(), str(video))
+        self.assertFalse(self.window.clear_video_button.isEnabled())
         self.assertEqual(len(list((rectified_output / "video_frames" / "collection").glob("*.jpg"))), 1)
         self.assertEqual(load_records(self.output / "review.jsonl")["old.jpg"], old_record)
         self.assertEqual(self.window.video_target_dir(self.output), raw_source)

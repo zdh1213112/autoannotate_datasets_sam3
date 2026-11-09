@@ -783,7 +783,7 @@ class GenericAnnotatorApp(QMainWindow):
                 updated[path.name] = {
                     "name": path.name, "objects": [], "candidates": [],
                     "candidate_count": 0, "status": "skipped",
-                    "reason": f"未抽中：自动标注图片比例 {percent}%",
+                    "reason": self.skipped_sampling_reason(percent),
                 }
                 changed = True
         if changed:
@@ -792,6 +792,9 @@ class GenericAnnotatorApp(QMainWindow):
             replace_review_records(self.active_output / "review.jsonl", updated)
             self.records = updated
 
+    def skipped_sampling_reason(self, percent):
+        return f"未抽中：自动标注图片比例 {percent}%"
+
     def validate_model_ready(self):
         if self.segmenter is None and not SAM3_MODEL.is_file():
             raise FileNotFoundError(f"找不到 SAM3 模型: {SAM3_MODEL}")
@@ -799,15 +802,22 @@ class GenericAnnotatorApp(QMainWindow):
     def make_detection_thread(self, files, config, done_names):
         return GenericThread(files, config, done_names, self.segmenter)
 
+    def sampling_candidates(self, files, config):
+        """Return images eligible for random sampling in this workflow."""
+        return files
+
     def start_detection(self):
         try:
-            self.config()
+            config = self.config()
             files = image_files(self.source_dir())
             if not files:
                 raise ValueError("图片目录为空")
+            if not self.sampling_candidates(files, config):
+                raise ValueError("抽帧设置未选中任何图片")
             self.validate_model_ready()
             config = self.ensure_project(allow_reconfigure=True)
-            sampled = sample_image_files(files, config["sample_percent"],
+            candidates = self.sampling_candidates(files, config)
+            sampled = sample_image_files(candidates, config["sample_percent"],
                                          config["sample_seed"])
             self.apply_sampling(files, sampled, config["sample_percent"])
             self.update_sample_summary()
@@ -1296,9 +1306,9 @@ class GenericAnnotatorApp(QMainWindow):
     def export(self):
         try:
             config = self.ensure_project()
+            candidates = self.sampling_candidates(image_files(self.active_source), config)
             allowed_names = {path.name for path in sample_image_files(
-                image_files(self.active_source), config["sample_percent"],
-                config["sample_seed"])}
+                candidates, config["sample_percent"], config["sample_seed"])}
             target, images, objects = export_generic(
                 self.active_source, self.active_output, self.records,
                 config["classes"], self.format_combo.currentData(), allowed_names)

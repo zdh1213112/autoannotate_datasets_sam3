@@ -14,7 +14,7 @@ import uuid
 import cv2
 
 from .orbbec_undistort import camera_id_for_video
-from .gray_glove_mcap import CAMERA_TOPICS, iter_mcap_frames, probe_mcap
+from .gray_glove_mcap import CAMERA_TOPICS, iter_mcap_frames, probe_mcap, validate_mcap_files
 
 
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mcap"})
@@ -119,6 +119,7 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
     videos = collect_videos(videos)
     mcap_files = [item for item in videos if item.suffix.lower() == ".mcap"]
     if mcap_files:
+        validate_mcap_files(mcap_files)
         regular = [item for item in videos if item.suffix.lower() != ".mcap"]
         total = reused = 0
         folder = None
