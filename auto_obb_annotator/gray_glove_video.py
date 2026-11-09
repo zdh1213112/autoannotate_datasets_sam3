@@ -14,9 +14,10 @@ import uuid
 import cv2
 
 from .orbbec_undistort import camera_id_for_video
+from .gray_glove_mcap import CAMERA_TOPICS, iter_mcap_frames, probe_mcap
 
 
-VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"})
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mcap"})
 
 
 def frame_camera_ids(folder: Path) -> dict[str, str]:
@@ -31,7 +32,7 @@ def frame_camera_ids(folder: Path) -> dict[str, str]:
             raise ValueError(f"抽帧来源记录无法读取: {manifest_path}") from exc
         for frame in frames:
             video = frame["video"]
-            camera_id = transform.get(video, {}).get("camera_id")
+            camera_id = frame.get("camera_id") or transform.get(video, {}).get("camera_id")
             if camera_id is None:
                 try:
                     camera_id = camera_id_for_video(Path(video))
@@ -52,9 +53,9 @@ def collect_videos(paths) -> list[Path]:
         elif path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
             videos.add(path)
         else:
-            raise ValueError(f"不是受支持的视频或视频目录: {path}")
+            raise ValueError(f"不是受支持的录像或录像目录: {path}")
     if not videos:
-        raise ValueError("没有找到可抽帧的视频")
+        raise ValueError("没有找到可抽帧的视频或 MCAP")
     return sorted(videos, key=lambda item: str(item))
 
 
@@ -107,7 +108,8 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
                         interval_value: float, start_seconds: float = 0.0,
                         end_seconds: float | None = None, progress=None,
                         should_continue=None, target_dir: Path | None = None,
-                        frame_transform=None, transform_info: dict | None = None
+                        frame_transform=None, transform_info: dict | None = None,
+                        mcap_camera_ids=None
                         ) -> tuple[Path, int, int]:
     """Append reproducibly named frames to one label directory and resume partial runs.
 
@@ -115,6 +117,26 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
     never overwritten. A manifest records source paths and frame indices.
     """
     videos = collect_videos(videos)
+    mcap_files = [item for item in videos if item.suffix.lower() == ".mcap"]
+    if mcap_files:
+        regular = [item for item in videos if item.suffix.lower() != ".mcap"]
+        total = reused = 0
+        folder = None
+        if regular:
+            folder, count, reused_here = extract_video_batch(
+                regular, output, interval_mode, interval_value, start_seconds,
+                end_seconds, progress, should_continue, target_dir,
+                frame_transform, transform_info)
+            total += count
+            reused += reused_here
+        for mcap in mcap_files:
+            folder, count, reused_here = _extract_mcap_batch(
+                mcap, output, interval_mode, interval_value, start_seconds,
+                end_seconds, progress, should_continue, target_dir,
+                frame_transform, transform_info, mcap_camera_ids)
+            total += count
+            reused += reused_here
+        return folder, total, reused
     if interval_mode not in {"frames", "seconds"}:
         raise ValueError("抽帧方式须为按帧或按秒")
     if not math.isfinite(interval_value) or interval_value <= 0:
@@ -218,6 +240,133 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
     manifest["complete"] = True
     _write_json_atomic(manifest_path, manifest)
     return target, total, reused
+
+
+def _extract_mcap_batch(mcap, output, interval_mode, interval_value,
+                        start_seconds, end_seconds, progress, should_continue,
+                        target_dir, frame_transform, transform_info, mcap_camera_ids):
+    if interval_mode not in {"frames", "seconds"} or not math.isfinite(interval_value) or interval_value <= 0:
+        raise ValueError("抽帧方式或间隔无效")
+    if interval_mode == "frames" and not float(interval_value).is_integer():
+        raise ValueError("按帧抽取时，间隔必须是整数")
+    if not math.isfinite(start_seconds) or start_seconds < 0:
+        raise ValueError("开始时间不能小于 0")
+    if end_seconds is not None and (not math.isfinite(end_seconds) or end_seconds <= start_seconds):
+        raise ValueError("结束时间必须大于开始时间")
+    if (frame_transform is None) != (transform_info is None):
+        raise ValueError("去畸变处理与来源记录必须同时指定")
+    mcap = Path(mcap).expanduser().resolve()
+    streams = probe_mcap(mcap, mcap_camera_ids)
+    output = Path(output).expanduser().resolve()
+    target = (Path(target_dir).expanduser().resolve() if target_dir is not None
+              else output / "video_frames" / "collection")
+    if target != output / "video_frames" / "collection" and not target.is_relative_to(
+            output / "video_frames"):
+        raise ValueError("抽帧目录必须位于结果目录的 video_frames 中")
+    stat = mcap.stat()
+    settings = {"interval_mode": interval_mode, "interval_value": interval_value,
+                "start_seconds": start_seconds, "end_seconds": end_seconds,
+                "mcap_camera_ids": [stream.camera_id for stream in streams]}
+    if transform_info is not None:
+        settings["transform"] = {stream.key: transform_info[stream.key] for stream in streams}
+    source_info = []
+    for stream in streams:
+        source_settings = {key: value for key, value in settings.items()
+                           if key not in {"mcap_camera_ids", "transform"}}
+        if transform_info is not None:
+            source_settings["transform"] = transform_info[stream.key]
+        signature = [str(mcap), stat.st_size, stat.st_mtime_ns, stream.topic,
+                     source_settings]
+        digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:10]
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", mcap.stem).strip("_")[:40] or "mcap"
+        source_info.append({"video": str(mcap), "topic": stream.topic,
+                            "camera_id": stream.camera_id,
+                            "source_message_count": stream.message_count,
+                            "prefix": f"{stem}_{stream.camera_id}_{digest}"})
+    batch_key = hashlib.sha256(json.dumps(
+        [source_info, settings], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    target.mkdir(parents=True, exist_ok=True)
+    manifest_path = target / f"extract_{batch_key}.json"
+    manifest = {"format_version": 2, "settings": settings,
+                "sources": source_info, "frames": [], "complete": False}
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if previous.get("settings") != settings or previous.get("sources") != source_info:
+            raise ValueError(f"抽帧记录与当前 MCAP 不一致，请检查: {manifest_path}")
+    _write_json_atomic(manifest_path, manifest)
+    prefixes = {item["topic"]: item["prefix"] for item in source_info}
+    range_indices = {stream.topic: 0 for stream in streams}
+    next_times = {stream.topic: start_seconds for stream in streams}
+    completed = reused = 0
+    estimated = 0
+    for stream in streams:
+        duration = (stream.last_log_time_ns - stream.first_log_time_ns) / 1e9
+        stop = min(duration + 1e-6, end_seconds) if end_seconds is not None else duration + 1e-6
+        if stop <= start_seconds:
+            continue
+        if interval_mode == "seconds":
+            estimated += math.ceil((stop - start_seconds) / interval_value)
+        else:
+            count = stream.message_count * (stop - start_seconds) / max(duration, 1e-6)
+            estimated += math.ceil(count / interval_value)
+    ended = set()
+    try:
+        for stream, index, seconds, image in iter_mcap_frames(
+                mcap, streams, should_continue):
+            if end_seconds is not None and seconds >= end_seconds:
+                ended.add(stream.topic)
+                if len(ended) == len(streams):
+                    break
+                continue
+            if seconds + 1e-9 < start_seconds:
+                continue
+            topic = stream.topic
+            if interval_mode == "frames":
+                selected = range_indices[topic] % int(interval_value) == 0
+            else:
+                selected = seconds + 1e-9 >= next_times[topic]
+            range_indices[topic] += 1
+            if not selected:
+                continue
+            if interval_mode == "seconds":
+                while next_times[topic] <= seconds + 1e-9:
+                    next_times[topic] += interval_value
+            name = f"{prefixes[topic]}__frame_{index:09d}.jpg"
+            destination = target / name
+            if destination.is_file() and destination.stat().st_size > 0:
+                reused += 1
+            else:
+                if hasattr(image, "to_ndarray"):
+                    image = image.to_ndarray(format="bgr24")
+                if frame_transform is not None:
+                    image = frame_transform((mcap, topic), image)
+                temporary = target / f".{name}.{uuid.uuid4().hex}.jpg"
+                try:
+                    if not cv2.imwrite(str(temporary), image,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 93]):
+                        raise OSError(f"无法写入抽帧图片: {name}")
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            manifest["frames"].append({"name": name, "video": str(mcap),
+                                       "topic": topic, "camera_id": stream.camera_id,
+                                       "source_frame": index,
+                                       "time_seconds": round(seconds, 6)})
+            completed += 1
+            if completed % 20 == 0:
+                _write_json_atomic(manifest_path, manifest)
+            if progress:
+                progress(completed, max(completed, estimated))
+    except Exception:
+        _write_json_atomic(manifest_path, manifest)
+        raise
+    if not completed:
+        raise ValueError(f"所选时间范围内没有可抽取的 MCAP 图像: {mcap}")
+    manifest["complete"] = True
+    _write_json_atomic(manifest_path, manifest)
+    if progress:
+        progress(completed, completed)
+    return target, completed, reused
 
 
 def video_frame_directory(video: Path, output: Path, interval_seconds: float) -> Path:

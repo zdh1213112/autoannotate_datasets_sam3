@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -35,15 +36,18 @@ def calibration_for_video(video: Path, override: Path | None = None) -> Path:
             raise FileNotFoundError(f"标定文件不存在: {path}")
         return path
     video = Path(video).expanduser().resolve()
-    matches = sorted(video.parent.glob("*_calibration_camera.yaml"))
-    session_prefix = video.stem.split("_camera_")[0]
-    exact = [path for path in matches if path.name == f"{session_prefix}_calibration_camera.yaml"]
-    if len(exact) == 1:
-        return exact[0]
-    if len(matches) == 1:
-        return matches[0]
+    # MCAP parts live one directory below the session calibration.
+    for folder in (video.parent, video.parent.parent):
+        matches = sorted(set(folder.glob("*_calibration_camera.yaml")) |
+                         set(folder.glob("*_params_cam_*.yaml")))
+        session_prefix = video.stem.split("_camera_")[0].split("_part")[0]
+        exact = [path for path in matches if path.name.startswith(session_prefix + "_")]
+        if len(exact) == 1:
+            return exact[0]
+        if len(matches) == 1:
+            return matches[0]
     raise FileNotFoundError(
-        f"未在视频目录找到唯一的 *_calibration_camera.yaml: {video.parent}；"
+        f"未在录像目录找到唯一的相机标定 YAML: {video.parent}；"
         "请手动选择对应标定文件")
 
 
@@ -51,7 +55,7 @@ class OrbbecUndistorter:
     """Build one OpenCV fisheye map per camera and reuse it for selected frames."""
 
     def __init__(self, videos: list[Path], calibration_override: Path | None = None,
-                 balance: float = 0.0):
+                 balance: float = 0.0, mcap_camera_ids=None):
         if not 0 <= balance <= 1:
             raise ValueError("保留视野比例须在 0～1 之间")
         self.balance = float(balance)
@@ -61,7 +65,21 @@ class OrbbecUndistorter:
         parsed = {}
         for raw_video in videos:
             video = Path(raw_video).expanduser().resolve()
-            camera_id = camera_id_for_video(video)
+            if video.suffix.lower() == ".mcap":
+                from .gray_glove_mcap import probe_mcap
+                sources = [(stream.key, stream.camera_id, None)
+                           for stream in probe_mcap(video, mcap_camera_ids)]
+            else:
+                camera_id = camera_id_for_video(video)
+                capture = cv2.VideoCapture(str(video))
+                try:
+                    if not capture.isOpened():
+                        raise ValueError(f"视频无法打开: {video}")
+                    actual_size = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                                   int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                finally:
+                    capture.release()
+                sources = [(str(video), camera_id, actual_size)]
             calibration_path = calibration_for_video(video, calibration_override)
             if calibration_path not in parsed:
                 payload = calibration_path.read_bytes()
@@ -72,61 +90,59 @@ class OrbbecUndistorter:
                 if not isinstance(data, dict) or not isinstance(data.get("cameras"), list):
                     raise ValueError(f"相机标定 YAML 缺少 cameras: {calibration_path}")
                 cameras = {str(item.get("id")): item for item in data.get("cameras", [])}
+                serial = str(data.get("calibration_info", {}).get("serial_number", ""))
+                if not serial:
+                    match = re.match(r"^EGO-[^_]+_([^_]+)_", calibration_path.name)
+                    serial = match.group(1) if match else ""
                 parsed[calibration_path] = (cameras, hashlib.sha256(payload).hexdigest(),
-                                            str(data.get("calibration_info", {}).get("serial_number", "")))
+                                            serial)
             cameras, digest, serial = parsed[calibration_path]
             if (video.stem.startswith("EGO-") and serial
                     and f"_{serial}_" not in video.stem):
                 raise ValueError(
                     f"视频 {video.name} 与标定文件序列号 {serial} 不匹配")
-            if camera_id not in cameras:
-                raise ValueError(f"标定文件缺少 {camera_id}: {calibration_path}")
-            camera = cameras[camera_id]
-            if str(camera.get("distortion_model", "")).upper() != "KB":
-                raise ValueError(f"{camera_id} 的畸变模型不是 KB: {calibration_path}")
-            size = (int(camera["image_width"]), int(camera["image_height"]))
-            if min(size) <= 0:
-                raise ValueError(f"{camera_id} 的标定分辨率无效")
-            intr = camera["intrinsics"]
-            dist = camera["distortion"]
-            matrix = np.array([[intr["fx"], 0, intr["cx"]],
-                               [0, intr["fy"], intr["cy"]], [0, 0, 1]], dtype=np.float64)
-            coefficients = np.array([dist[f"k{index}"] for index in range(1, 5)],
-                                    dtype=np.float64)
-            if (not np.isfinite(matrix).all() or not np.isfinite(coefficients).all()
-                    or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
-                raise ValueError(f"{camera_id} 的标定参数无效")
-            capture = cv2.VideoCapture(str(video))
-            try:
-                if not capture.isOpened():
-                    raise ValueError(f"视频无法打开: {video}")
-                actual_size = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                               int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            finally:
-                capture.release()
-            if actual_size != size:
-                raise ValueError(
-                    f"{video.name} 的实际画面 {actual_size[0]}×{actual_size[1]} "
-                    f"与 {camera_id} 标定 {size[0]}×{size[1]} 不一致")
-            rotation = np.eye(3, dtype=np.float64)
-            new_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                matrix, coefficients, size, rotation, balance=self.balance, new_size=size)
-            self._by_video[video] = (camera_id, size, matrix, coefficients,
-                                     new_matrix, digest)
-            self.metadata[str(video)] = {
-                "camera_id": camera_id, "calibration_path": str(calibration_path),
-                "calibration_sha256": digest, "calibration_serial": serial,
-                "image_size": list(size), "balance": self.balance,
-                "projection": "independent_kb_fisheye_undistortion",
-                "new_camera_matrix": new_matrix.tolist(),
-            }
+            for source_key, camera_id, actual_size in sources:
+                if camera_id not in cameras:
+                    raise ValueError(f"标定文件缺少 {camera_id}: {calibration_path}")
+                camera = cameras[camera_id]
+                if str(camera.get("distortion_model", "")).upper() != "KB":
+                    raise ValueError(f"{camera_id} 的畸变模型不是 KB: {calibration_path}")
+                size = (int(camera["image_width"]), int(camera["image_height"]))
+                if min(size) <= 0:
+                    raise ValueError(f"{camera_id} 的标定分辨率无效")
+                intr = camera["intrinsics"]
+                dist = camera["distortion"]
+                matrix = np.array([[intr["fx"], 0, intr["cx"]],
+                                   [0, intr["fy"], intr["cy"]], [0, 0, 1]], dtype=np.float64)
+                coefficients = np.array([dist[f"k{index}"] for index in range(1, 5)],
+                                        dtype=np.float64)
+                if (not np.isfinite(matrix).all() or not np.isfinite(coefficients).all()
+                        or matrix[0, 0] <= 0 or matrix[1, 1] <= 0):
+                    raise ValueError(f"{camera_id} 的标定参数无效")
+                if actual_size is not None and actual_size != size:
+                    raise ValueError(
+                        f"{video.name} 的实际画面 {actual_size[0]}×{actual_size[1]} "
+                        f"与 {camera_id} 标定 {size[0]}×{size[1]} 不一致")
+                rotation = np.eye(3, dtype=np.float64)
+                new_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                    matrix, coefficients, size, rotation, balance=self.balance, new_size=size)
+                self._by_video[source_key] = (camera_id, size, matrix, coefficients,
+                                              new_matrix, digest)
+                self.metadata[source_key] = {
+                    "camera_id": camera_id, "calibration_path": str(calibration_path),
+                    "calibration_sha256": digest, "calibration_serial": serial,
+                    "image_size": list(size), "balance": self.balance,
+                    "projection": "independent_kb_fisheye_undistortion",
+                    "new_camera_matrix": new_matrix.tolist(),
+                }
 
     def __call__(self, video: Path, frame: np.ndarray) -> np.ndarray:
-        video = Path(video).expanduser().resolve()
-        camera_id, size, matrix, coefficients, new_matrix, digest = self._by_video[video]
+        source_key = (str(Path(video[0]).expanduser().resolve()) + "::" + video[1]
+                      if isinstance(video, tuple) else str(Path(video).expanduser().resolve()))
+        camera_id, size, matrix, coefficients, new_matrix, digest = self._by_video[source_key]
         if (frame.shape[1], frame.shape[0]) != size:
             raise ValueError(
-                f"{video.name} 的实际画面 {frame.shape[1]}×{frame.shape[0]} "
+                f"{source_key} 的实际画面 {frame.shape[1]}×{frame.shape[0]} "
                 f"与 {camera_id} 标定 {size[0]}×{size[1]} 不一致")
         key = (digest, camera_id, size, self.balance)
         if key not in self._maps:

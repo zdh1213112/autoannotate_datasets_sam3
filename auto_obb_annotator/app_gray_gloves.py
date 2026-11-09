@@ -23,6 +23,7 @@ from .app import torch
 from .app_generic import GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread
 from .generic_core import detect_generic
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
+from .gray_glove_mcap import CAMERA_TOPICS
 from .orbbec_undistort import OrbbecUndistorter
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
@@ -228,7 +229,7 @@ class VideoFrameThread(QThread):
                  interval_value: float, start_seconds: float,
                  end_seconds: float | None, target_dir: Path | None,
                  undistort: bool = False, calibration: Path | None = None,
-                 balance: float = 0.0):
+                 balance: float = 0.0, mcap_camera_ids=None):
         super().__init__()
         self.videos = videos
         self.output = output
@@ -240,6 +241,7 @@ class VideoFrameThread(QThread):
         self.undistort = undistort
         self.calibration = calibration
         self.balance = balance
+        self.mcap_camera_ids = mcap_camera_ids
         self.running = True
 
     def stop(self):
@@ -247,7 +249,8 @@ class VideoFrameThread(QThread):
 
     def run(self):
         try:
-            rectifier = (OrbbecUndistorter(self.videos, self.calibration, self.balance)
+            rectifier = (OrbbecUndistorter(self.videos, self.calibration, self.balance,
+                                          self.mcap_camera_ids)
                          if self.undistort else None)
             folder, count, reused = extract_video_batch(
                 self.videos, self.output, self.interval_mode,
@@ -255,7 +258,8 @@ class VideoFrameThread(QThread):
                 progress=lambda done, total: self.progress_signal.emit(done, total),
                 should_continue=lambda: self.running, target_dir=self.target_dir,
                 frame_transform=rectifier,
-                transform_info=rectifier.metadata if rectifier is not None else None)
+                transform_info=rectifier.metadata if rectifier is not None else None,
+                mcap_camera_ids=self.mcap_camera_ids)
             self.complete_signal.emit(str(folder), count, reused, str(self.output))
         except Exception as exc:
             self.error_signal.emit(str(exc))
@@ -298,7 +302,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
 
-        self.video_group = QGroupBox("视频抽帧：可批量添加视频或文件夹，完成后直接载入标注")
+        self.video_group = QGroupBox("视频 / MCAP 抽帧：可添加录像或文件夹，完成后直接载入标注")
         video_layout = QVBoxLayout(self.video_group)
         video_row = QHBoxLayout()
         self.video_edit = QLineEdit(str(DEFAULT_VIDEO) if DEFAULT_VIDEO.is_file() else "")
@@ -329,6 +333,17 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         queue_buttons.addWidget(self.clear_video_button)
         queue_row.addLayout(queue_buttons)
         video_layout.addLayout(queue_row)
+        mcap_row = QHBoxLayout()
+        mcap_row.addWidget(QLabel("MCAP 相机"))
+        self.mcap_camera_checks = {}
+        for camera_id, label in (("cam_0", "左主"), ("cam_1", "右主"),
+                                 ("cam_2", "右侧"), ("cam_3", "左侧")):
+            check = QCheckBox(f"{label} ({camera_id})")
+            check.setChecked(True)
+            self.mcap_camera_checks[camera_id] = check
+            mcap_row.addWidget(check)
+        mcap_row.addStretch(1)
+        video_layout.addLayout(mcap_row)
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("抽帧间隔"))
         self.interval_mode = QComboBox()
@@ -371,7 +386,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         undistort_row = QHBoxLayout()
         undistort_row.addWidget(QLabel("Orbbec 标定"))
         self.calibration_edit = QLineEdit()
-        self.calibration_edit.setPlaceholderText("留空：按每个视频所在目录自动查找四目标定 YAML")
+        self.calibration_edit.setPlaceholderText("留空：自动查找视频目录或 MCAP 上级目录的四目标定 YAML")
         self.calibration_edit.setToolTip(
             "手动指定仅适合所选视频共用同一标定；留空可按每段视频自动匹配。")
         undistort_row.addWidget(self.calibration_edit, 1)
@@ -518,6 +533,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
                            self.calibration_button, self.balance_spin,
                            self.undistort_button):
                 widget.setEnabled(available)
+            for check in self.mcap_camera_checks.values():
+                check.setEnabled(available)
             self.end_spin.setEnabled(available and self.end_check.isChecked())
 
     def make_detection_thread(self, files, config, done_names):
@@ -739,7 +756,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def choose_video(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "选择戴灰色手套的视频", self.video_edit.text(),
-            "视频 (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)")
+            "录像 (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.mcap)")
         if paths:
             self.add_video_paths(paths)
 
@@ -771,7 +788,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             if str(video) not in existing:
                 self.video_list.addItem(str(video))
         self.video_edit.clear()
-        self.video_progress.setText(f"已加入 {self.video_list.count()} 个视频；可设时间范围再抽帧")
+        self.video_progress.setText(f"已加入 {self.video_list.count()} 个录像文件；可设时间范围再抽帧")
 
     def add_manual_video(self):
         raw = self.video_edit.text().strip()
@@ -781,7 +798,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def remove_selected_videos(self):
         for item in self.video_list.selectedItems():
             self.video_list.takeItem(self.video_list.row(item))
-        self.video_progress.setText(f"列表中还有 {self.video_list.count()} 个视频")
+        self.video_progress.setText(f"列表中还有 {self.video_list.count()} 个录像文件")
 
     def update_interval_mode(self):
         mode = self.interval_mode.currentData()
@@ -838,6 +855,10 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             if not sources and self.video_edit.text().strip():
                 sources = [self.video_edit.text().strip()]
             videos = collect_videos(sources)
+            mcap_camera_ids = tuple(camera_id for camera_id in CAMERA_TOPICS
+                                    if self.mcap_camera_checks[camera_id].isChecked())
+            if any(video.suffix.lower() == ".mcap" for video in videos) and not mcap_camera_ids:
+                raise ValueError("请至少勾选一路 MCAP 相机")
             if self.end_check.isChecked() and self.end_spin.value() <= self.start_spin.value():
                 raise ValueError("结束时间必须大于开始时间")
             output = self.output_for_video_mode(undistort)
@@ -851,7 +872,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             videos, output, self.interval_mode.currentData(),
             self.interval_spin.value(), self.start_spin.value(),
             self.end_spin.value() if self.end_check.isChecked() else None,
-            target, undistort, calibration, self.balance_spin.value())
+            target, undistort, calibration, self.balance_spin.value(), mcap_camera_ids)
         self.video_thread.progress_signal.connect(self.update_video_progress)
         self.video_thread.complete_signal.connect(self.video_imported)
         self.video_thread.error_signal.connect(self.video_import_error)
@@ -860,7 +881,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.stop_button.setEnabled(True)
         self.set_config_controls(False)
         action = "去畸变并抽帧" if undistort else "抽帧"
-        self.video_progress.setText(f"正在{action}：{len(videos)} 个视频...")
+        self.video_progress.setText(f"正在{action}：{len(videos)} 个录像文件...")
         self.video_thread.start()
 
     def update_video_progress(self, done, total):

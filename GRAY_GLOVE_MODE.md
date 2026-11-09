@@ -8,7 +8,7 @@ python run_gray_gloves.py
 这是独立的新入口，原有 `run_generic.py`、`run_generic_yolo.py` 和手套标注脚本保持可用。
 默认模型是 `models/sam3.pt`，左右手版结果保存在独立的
 `data/gray_glove_lr_annotations`；旧单类结果目录 `data/gray_glove_annotations` 不会被覆盖。
-默认视频框中已填入提供的 `camera_left.mp4`；可加入其他 MP4/MOV/AVI/MKV/WebM/M4V 文件。
+默认视频框中已填入提供的 `camera_left.mp4`；可加入其他视频或 MCAP 文件。
 
 ## 从视频开始
 
@@ -35,6 +35,12 @@ python run_gray_gloves.py
    ```
 
 也可以跳过视频抽帧，直接选择已有图片目录。视频和标注记录不会写回原始录像目录。
+
+### MCAP 四目录像
+
+可直接添加 `.mcap` 文件，或添加包含 `part0001/*.mcap` 的录制目录。界面中的「MCAP 相机」可勾选要抽取的视角，默认四路全选：左主 `cam_0`、右主 `cam_1`、右侧 `cam_2`、左侧 `cam_3`。按秒、按帧、起止时间和「去畸变抽帧」沿用上面的设置；只保存选中的帧，不转换整段录像。每张图片和 `extract_*.json` 都记录相机 topic、原始帧号和时间，重新执行相同设置会复用已有图片。
+
+MCAP 去畸变会自动查找同目录或上级录制目录中的 `*_params_cam_*.yaml`，每路使用对应的 KB 参数。也可以在界面手动指定标定 YAML。MCAP 的 H264 图像读取需要安装 `requirements.txt` 中的 `mcap`、`mcap-protobuf-support` 和 `av`。
 
 ## 针对当前画面的默认值
 
