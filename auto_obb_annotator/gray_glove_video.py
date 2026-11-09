@@ -4,12 +4,185 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import shutil
 import uuid
 
 import cv2
+
+
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"})
+
+
+def collect_videos(paths) -> list[Path]:
+    """Expand folders recursively and return unique videos in a stable order."""
+    videos = set()
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if path.is_dir():
+            videos.update(item.resolve() for item in path.rglob("*")
+                          if item.is_file() and item.suffix.lower() in VIDEO_SUFFIXES)
+        elif path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
+            videos.add(path)
+        else:
+            raise ValueError(f"不是受支持的视频或视频目录: {path}")
+    if not videos:
+        raise ValueError("没有找到可抽帧的视频")
+    return sorted(videos, key=lambda item: str(item))
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _frame_plan(video: Path, interval_mode: str, interval_value: float,
+                start_seconds: float, end_seconds: float | None) -> tuple[float, int, list[int]]:
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise ValueError(f"视频无法打开: {video}")
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    if not math.isfinite(fps) or fps <= 0 or frame_count <= 0:
+        raise ValueError(f"视频缺少有效帧率或帧数: {video}")
+    first = max(0, math.ceil(start_seconds * fps))
+    stop = min(frame_count, math.ceil(end_seconds * fps) if end_seconds is not None
+               else frame_count)
+    if interval_mode == "frames":
+        indices = list(range(first, stop, int(interval_value)))
+    else:
+        indices = []
+        last_index = -1
+        limit = min(frame_count / fps, end_seconds if end_seconds is not None
+                    else frame_count / fps)
+        sample = 0
+        while True:
+            timestamp = start_seconds + sample * interval_value
+            if timestamp >= limit - 1e-9:
+                break
+            index = math.ceil(timestamp * fps - 1e-9)
+            if index > last_index and index < stop:
+                indices.append(index)
+                last_index = index
+            sample += 1
+    return fps, frame_count, indices
+
+
+def extract_video_batch(videos, output: Path, interval_mode: str,
+                        interval_value: float, start_seconds: float = 0.0,
+                        end_seconds: float | None = None, progress=None,
+                        should_continue=None, target_dir: Path | None = None
+                        ) -> tuple[Path, int, int]:
+    """Append reproducibly named frames to one label directory and resume partial runs.
+
+    Returns (directory, total_selected_frames, frames_reused). Existing JPEGs are
+    never overwritten. A manifest records source paths and frame indices.
+    """
+    videos = collect_videos(videos)
+    if interval_mode not in {"frames", "seconds"}:
+        raise ValueError("抽帧方式须为按帧或按秒")
+    if not math.isfinite(interval_value) or interval_value <= 0:
+        raise ValueError("抽帧间隔必须大于 0")
+    if interval_mode == "frames" and not float(interval_value).is_integer():
+        raise ValueError("按帧抽取时，间隔必须是整数")
+    if not math.isfinite(start_seconds) or start_seconds < 0:
+        raise ValueError("开始时间不能小于 0")
+    if end_seconds is not None and (not math.isfinite(end_seconds)
+                                    or end_seconds <= start_seconds):
+        raise ValueError("结束时间必须大于开始时间")
+    output = Path(output).expanduser().resolve()
+    target = (Path(target_dir).expanduser().resolve() if target_dir is not None
+              else output / "video_frames" / "collection")
+    if target != output / "video_frames" / "collection" and not target.is_relative_to(
+            output / "video_frames"):
+        raise ValueError("抽帧目录必须位于结果目录的 video_frames 中")
+    settings = {"interval_mode": interval_mode, "interval_value": interval_value,
+                "start_seconds": start_seconds, "end_seconds": end_seconds}
+    planned = []
+    source_info = []
+    for video in videos:
+        stat = video.stat()
+        fps, source_count, indices = _frame_plan(
+            video, interval_mode, interval_value, start_seconds, end_seconds)
+        signature = json.dumps([str(video), stat.st_size, stat.st_mtime_ns, settings],
+                               sort_keys=True)
+        source_id = hashlib.sha256(signature.encode()).hexdigest()[:10]
+        stem = re.sub(r"[^A-Za-z0-9_-]+", "_", video.stem).strip("_")[:48] or "video"
+        prefix = f"{stem}_{source_id}"
+        source_info.append({"video": str(video), "fps": fps,
+                            "source_frame_count": source_count,
+                            "selected_count": len(indices), "prefix": prefix})
+        planned.extend((video, fps, index, f"{prefix}__frame_{index:09d}.jpg")
+                       for index in indices)
+    if not planned:
+        raise ValueError("所选时间范围内没有可抽取的帧")
+    batch_key = hashlib.sha256(json.dumps(
+        [source_info, settings], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    target.mkdir(parents=True, exist_ok=True)
+    manifest_path = target / f"extract_{batch_key}.json"
+    manifest = {"format_version": 1, "settings": settings, "sources": source_info,
+                "frames": [{"name": name, "video": str(video),
+                            "source_frame": index, "time_seconds": round(index / fps, 6)}
+                           for video, fps, index, name in planned],
+                "complete": False}
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if any(previous.get(key) != manifest[key]
+               for key in ("settings", "sources", "frames")):
+            raise ValueError(f"抽帧记录与当前视频不一致，请检查: {manifest_path}")
+    _write_json_atomic(manifest_path, manifest)
+    total = len(planned)
+    completed = 0
+    reused = 0
+    current_video = None
+    capture = None
+    try:
+        for video, _fps, index, name in planned:
+            if should_continue is not None and not should_continue():
+                raise InterruptedError(f"已停止抽帧，已完成 {completed}/{total} 张；再次点击可继续")
+            destination = target / name
+            if destination.is_file() and destination.stat().st_size > 0:
+                reused += 1
+            else:
+                if video != current_video:
+                    if capture is not None:
+                        capture.release()
+                    capture = cv2.VideoCapture(str(video))
+                    if not capture.isOpened():
+                        raise ValueError(f"视频无法打开: {video}")
+                    current_video = video
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, image = capture.read()
+                if not ok or image is None:
+                    raise ValueError(f"视频第 {index} 帧无法解码: {video}")
+                temporary = target / f".{name}.{uuid.uuid4().hex}.jpg"
+                try:
+                    if not cv2.imwrite(str(temporary), image,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 93]):
+                        raise OSError(f"无法写入抽帧图片: {name}")
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            completed += 1
+            if progress:
+                progress(completed, total)
+    finally:
+        if capture is not None:
+            capture.release()
+    manifest["complete"] = True
+    _write_json_atomic(manifest_path, manifest)
+    return target, total, reused
 
 
 def video_frame_directory(video: Path, output: Path, interval_seconds: float) -> Path:

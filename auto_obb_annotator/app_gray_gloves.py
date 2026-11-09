@@ -13,15 +13,16 @@ import numpy as np
 from PyQt5.QtCore import QCoreApplication, QLibraryInfo, QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
-    QShortcut, QSpinBox, QVBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDoubleSpinBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QMessageBox, QPushButton, QScrollArea, QShortcut, QSpinBox,
+    QVBoxLayout,
 )
 
 from .app import torch
 from .app_generic import GenericAnnotatorApp, GenericSAM3Segmenter, GenericThread
 from .generic_core import detect_generic
-from .gray_glove_video import extract_video_frames
+from .gray_glove_video import collect_videos, extract_video_batch
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
@@ -204,14 +205,20 @@ class GrayGloveThread(GenericThread):
 
 class VideoFrameThread(QThread):
     progress_signal = pyqtSignal(int, int)
-    complete_signal = pyqtSignal(str, int, bool)
+    complete_signal = pyqtSignal(str, int, int)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, video: Path, output: Path, interval: float):
+    def __init__(self, videos: list[Path], output: Path, interval_mode: str,
+                 interval_value: float, start_seconds: float,
+                 end_seconds: float | None, target_dir: Path | None):
         super().__init__()
-        self.video = video
+        self.videos = videos
         self.output = output
-        self.interval = interval
+        self.interval_mode = interval_mode
+        self.interval_value = interval_value
+        self.start_seconds = start_seconds
+        self.end_seconds = end_seconds
+        self.target_dir = target_dir
         self.running = True
 
     def stop(self):
@@ -219,10 +226,11 @@ class VideoFrameThread(QThread):
 
     def run(self):
         try:
-            folder, count, reused = extract_video_frames(
-                self.video, self.output, self.interval,
+            folder, count, reused = extract_video_batch(
+                self.videos, self.output, self.interval_mode,
+                self.interval_value, self.start_seconds, self.end_seconds,
                 progress=lambda done, total: self.progress_signal.emit(done, total),
-                should_continue=lambda: self.running)
+                should_continue=lambda: self.running, target_dir=self.target_dir)
             self.complete_signal.emit(str(folder), count, reused)
         except (OSError, ValueError, InterruptedError) as exc:
             self.error_signal.emit(str(exc))
@@ -265,18 +273,43 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
 
-        self.video_group = QGroupBox("视频抽帧：先选视频，再把帧载入图片目录")
+        self.video_group = QGroupBox("视频抽帧：可批量添加视频或文件夹，完成后直接载入标注")
         video_layout = QVBoxLayout(self.video_group)
         video_row = QHBoxLayout()
         self.video_edit = QLineEdit(str(DEFAULT_VIDEO) if DEFAULT_VIDEO.is_file() else "")
-        self.video_edit.setPlaceholderText("选择 MP4/MOV/AVI/MKV 视频")
-        self.video_button = QPushButton("选择视频 [Alt+V]")
+        self.video_edit.setPlaceholderText("输入一个视频路径，点“加入列表”；也可直接批量选择")
+        self.video_button = QPushButton("添加视频 [Alt+V]")
         self.video_button.clicked.connect(self.choose_video)
+        self.folder_button = QPushButton("添加文件夹")
+        self.folder_button.clicked.connect(self.choose_video_folder)
+        self.add_path_button = QPushButton("加入列表")
+        self.add_path_button.clicked.connect(self.add_manual_video)
         video_row.addWidget(self.video_edit, 1)
         video_row.addWidget(self.video_button)
+        video_row.addWidget(self.folder_button)
+        video_row.addWidget(self.add_path_button)
         video_layout.addLayout(video_row)
+        queue_row = QHBoxLayout()
+        self.video_list = QListWidget()
+        self.video_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.video_list.setMaximumHeight(90)
+        self.video_list.setToolTip("每个视频的抽帧图片会使用唯一文件名；可以多选并移除。")
+        self.remove_video_button = QPushButton("移除选中")
+        self.remove_video_button.clicked.connect(self.remove_selected_videos)
+        self.clear_video_button = QPushButton("清空列表")
+        self.clear_video_button.clicked.connect(self.video_list.clear)
+        queue_row.addWidget(self.video_list, 1)
+        queue_buttons = QVBoxLayout()
+        queue_buttons.addWidget(self.remove_video_button)
+        queue_buttons.addWidget(self.clear_video_button)
+        queue_row.addLayout(queue_buttons)
+        video_layout.addLayout(queue_row)
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("抽帧间隔"))
+        self.interval_mode = QComboBox()
+        self.interval_mode.addItem("每隔秒", "seconds")
+        self.interval_mode.addItem("每隔帧", "frames")
+        interval_row.addWidget(self.interval_mode)
         self.interval_spin = QDoubleSpinBox()
         self.interval_spin.setRange(0.1, 60.0)
         self.interval_spin.setSingleStep(0.25)
@@ -285,6 +318,25 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.interval_spin.setSuffix(" 秒")
         self.interval_spin.setToolTip("例如 1 秒约取 1 张；载入后还能用随机百分比抽样。")
         interval_row.addWidget(self.interval_spin)
+        self._interval_values = {"seconds": 1.0, "frames": 30.0}
+        self._last_interval_mode = "seconds"
+        self.interval_mode.currentIndexChanged.connect(self.update_interval_mode)
+        interval_row.addWidget(QLabel("开始于"))
+        self.start_spin = QDoubleSpinBox()
+        self.start_spin.setRange(0, 864000)
+        self.start_spin.setDecimals(2)
+        self.start_spin.setSuffix(" 秒")
+        interval_row.addWidget(self.start_spin)
+        self.end_check = QCheckBox("结束于")
+        interval_row.addWidget(self.end_check)
+        self.end_spin = QDoubleSpinBox()
+        self.end_spin.setRange(0, 864000)
+        self.end_spin.setDecimals(2)
+        self.end_spin.setValue(60)
+        self.end_spin.setSuffix(" 秒")
+        self.end_spin.setEnabled(False)
+        self.end_check.toggled.connect(self.end_spin.setEnabled)
+        interval_row.addWidget(self.end_spin)
         self.import_button = QPushButton("抽帧并载入 [Alt+G]")
         self.import_button.clicked.connect(self.import_video)
         interval_row.addWidget(self.import_button)
@@ -411,8 +463,13 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if hasattr(self, "video_edit"):
             available = enabled and not (self.video_thread and self.video_thread.isRunning())
             for widget in (self.video_edit, self.video_button,
-                           self.interval_spin, self.import_button):
+                           self.folder_button, self.add_path_button,
+                           self.video_list, self.remove_video_button,
+                           self.clear_video_button, self.interval_mode,
+                           self.interval_spin, self.start_spin, self.end_check,
+                           self.import_button):
                 widget.setEnabled(available)
+            self.end_spin.setEnabled(available and self.end_check.isChecked())
 
     def make_detection_thread(self, files, config, done_names):
         return GrayGloveThread(files, config, done_names, self.segmenter)
@@ -628,26 +685,90 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         LargePreviewDialog(self.preview_pixmap, self.current_name, self).exec_()
 
     def choose_video(self):
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self, "选择戴灰色手套的视频", self.video_edit.text(),
-            "视频 (*.mp4 *.mov *.avi *.mkv)")
-        if path:
-            self.video_edit.setText(path)
+            "视频 (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)")
+        if paths:
+            self.add_video_paths(paths)
+
+    def choose_video_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "添加视频文件夹（递归查找）", self.video_edit.text())
+        if folder:
+            self.add_video_paths([folder])
+
+    def add_video_paths(self, paths):
+        try:
+            videos = collect_videos(paths)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法添加视频", str(exc))
+            return
+        existing = {self.video_list.item(index).text()
+                    for index in range(self.video_list.count())}
+        for video in videos:
+            if str(video) not in existing:
+                self.video_list.addItem(str(video))
+        self.video_edit.clear()
+        self.video_progress.setText(f"已加入 {self.video_list.count()} 个视频；可设时间范围再抽帧")
+
+    def add_manual_video(self):
+        raw = self.video_edit.text().strip()
+        if raw:
+            self.add_video_paths([raw])
+
+    def remove_selected_videos(self):
+        for item in self.video_list.selectedItems():
+            self.video_list.takeItem(self.video_list.row(item))
+        self.video_progress.setText(f"列表中还有 {self.video_list.count()} 个视频")
+
+    def update_interval_mode(self):
+        mode = self.interval_mode.currentData()
+        self._interval_values[self._last_interval_mode] = self.interval_spin.value()
+        if mode == "frames":
+            self.interval_spin.setDecimals(0)
+            self.interval_spin.setRange(1, 1000000)
+            self.interval_spin.setSingleStep(1)
+            self.interval_spin.setSuffix(" 帧")
+        else:
+            self.interval_spin.setDecimals(2)
+            self.interval_spin.setRange(0.1, 3600)
+            self.interval_spin.setSingleStep(0.25)
+            self.interval_spin.setSuffix(" 秒")
+        self.interval_spin.setValue(self._interval_values[mode])
+        self._last_interval_mode = mode
+
+    def video_target_dir(self, output: Path) -> Path:
+        """Append to an existing video project so its reviewed labels remain visible."""
+        source = self.active_source
+        if (source is not None and self.active_output == output and source.is_dir()
+                and source.is_relative_to(output / "video_frames")):
+            return source
+        return output / "video_frames" / "collection"
 
     def import_video(self):
         if self.thread is not None and self.thread.isRunning():
             self.status.setText("请先停止自动检测，再切换视频。")
             return
+        if self.video_thread is not None and self.video_thread.isRunning():
+            return
         try:
-            video = Path(self.video_edit.text().strip()).expanduser().resolve()
-            if not video.is_file():
-                raise FileNotFoundError(f"视频文件不存在: {video}")
+            sources = [self.video_list.item(index).text()
+                       for index in range(self.video_list.count())]
+            if not sources and self.video_edit.text().strip():
+                sources = [self.video_edit.text().strip()]
+            videos = collect_videos(sources)
+            if self.end_check.isChecked() and self.end_spin.value() <= self.start_spin.value():
+                raise ValueError("结束时间必须大于开始时间")
             output = self.output_dir()
+            target = self.video_target_dir(output)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法抽帧", str(exc))
             return
-        self.video_thread = VideoFrameThread(video, output,
-                                             self.interval_spin.value())
+        self.video_thread = VideoFrameThread(
+            videos, output, self.interval_mode.currentData(),
+            self.interval_spin.value(), self.start_spin.value(),
+            self.end_spin.value() if self.end_check.isChecked() else None,
+            target)
         self.video_thread.progress_signal.connect(self.update_video_progress)
         self.video_thread.complete_signal.connect(self.video_imported)
         self.video_thread.error_signal.connect(self.video_import_error)
@@ -655,7 +776,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.set_config_controls(False)
-        self.video_progress.setText("正在抽帧...")
+        self.video_progress.setText(f"正在抽帧：{len(videos)} 个视频...")
         self.video_thread.start()
 
     def update_video_progress(self, done, total):
@@ -669,7 +790,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.show_roi()
         self.update_sample_summary()
         self.video_progress.setText(
-            f"{'已复用' if reused else '已抽取'} {count} 张；按 F5 开始标注")
+            f"抽帧完成 {count} 张（复用 {reused} 张）；按 F5 开始标注")
         self.status.setText(f"图片目录已切换到 {folder}；可调抽样比例后按 F5。")
 
     def video_import_error(self, message):
