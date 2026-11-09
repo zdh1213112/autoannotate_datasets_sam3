@@ -186,7 +186,7 @@ class GrayGloveVideoTests(unittest.TestCase):
         migrated = ui.normalize_glove_config(old)
         self.assertEqual(old["target_count"], 3)
         self.assertEqual(migrated["target_count"], 2)
-        self.assertEqual(migrated["confidence"], 0.50)
+        self.assertEqual(migrated["confidence"], 0.20)
         self.assertEqual(migrated["selection_rule"], "confidence")
         self.assertEqual(ui.normalize_glove_config({**old, "count_mode": "all"})
                          ["count_mode"], "fixed")
@@ -194,9 +194,18 @@ class GrayGloveVideoTests(unittest.TestCase):
                   "selection_rule": "area"}
         self.assertEqual(ui.normalize_glove_config(custom), custom)
 
-    def test_thread_rejects_low_score_background_and_keeps_uncertain_single_hand(self):
-        # Reproduce the screenshot: three prompts agree on the glove; the
-        # chair/garment predictions score 0.487 and below. No GPU is needed.
+        previous_default = {**migrated, "glove_selection_version": 1, "confidence": 0.50}
+        self.assertEqual(ui.normalize_glove_config(previous_default)["confidence"], 0.20)
+        for cutoff in (0.15, 0.30, 0.65):
+            self.assertEqual(ui.normalize_glove_config({**previous_default, "confidence": cutoff})
+                             ["confidence"], cutoff)
+        # A deliberate 0.50 cutoff in a current-version project stays editable.
+        self.assertEqual(ui.normalize_glove_config({**migrated, "confidence": 0.50})
+                         ["confidence"], 0.50)
+
+    def test_thread_keeps_top_two_including_low_score_glove_for_review(self):
+        # A low score can belong to a real hand: keep it for manual review.
+        # Duplicate prompt predictions must not occupy both selected slots.
         source = self.root / "images"
         source.mkdir()
         image = source / "frame.jpg"
@@ -227,11 +236,21 @@ class GrayGloveVideoTests(unittest.TestCase):
             thread.run()
         self.assertEqual(len(results), 1, messages)
         record = results[0]
-        self.assertEqual([obj["score"] for obj in record["objects"]], [0.8179])
-        self.assertEqual(record["candidate_count"], 3)
+        self.assertEqual([obj["score"] for obj in record["objects"]], [0.8179, 0.487])
+        self.assertEqual(record["candidate_count"], 6)
         self.assertEqual(record["status"], "review")
-        self.assertTrue(record["side_pending"])
-        self.assertIn("单手左右未定", record["reason"])
+        self.assertIn("低置信度", record["reason"])
+
+        # Missing proposals still leave a single hand with unresolved sides.
+        detections = [item for item in detections if item["score"] >= 0.50]
+        results.clear()
+        with patch.object(ui.GenericSAM3Segmenter, "detect_many", return_value=detections), \
+                patch.object(ui, "frame_camera_ids", return_value={image.name: "cam_3"}), \
+                patch.object(ui.torch.cuda, "is_available", return_value=False):
+            thread.run()
+        self.assertEqual(len(results[0]["objects"]), 1)
+        self.assertTrue(results[0]["side_pending"])
+        self.assertIn("单手左右未定", results[0]["reason"])
 
         # Consistent directional evidence can still pass a single side-view
         # glove automatically; a second glove must not be invented.
@@ -276,7 +295,7 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(self.window.count_combo.currentData(), "fixed")
         self.assertEqual(self.window.count_spin.value(), 2)
         self.assertEqual(self.window.selection_combo.currentData(), "confidence")
-        self.assertEqual(self.window.confidence_spin.value(), 0.50)
+        self.assertEqual(self.window.confidence_spin.value(), 0.20)
         self.assertEqual(self.window.count_spin.maximum(), 2)
         self.assertEqual(self.window.count_combo.findData("all"), -1)
         self.assertFalse(self.window.show_candidates_check.isChecked())
@@ -332,8 +351,8 @@ class GrayGloveUITests(unittest.TestCase):
         self.window.ensure_project()
         path = self.output / "project.json"
         legacy = json.loads(path.read_text())
-        legacy.pop("glove_selection_version")
-        legacy.update(target_count=3, confidence=0.20, selection_rule="area")
+        legacy.update(glove_selection_version=1, target_count=3,
+                      confidence=0.50, selection_rule="area")
         path.write_text(json.dumps(legacy))
         records = [
             {"name": "manual.jpg", "status": "confirmed", "objects": [
@@ -346,7 +365,7 @@ class GrayGloveUITests(unittest.TestCase):
             append_record(self.output / "review.jsonl", record)
         self.window.load_project()
         self.assertEqual(self.window.count_spin.value(), 2)
-        self.assertEqual(self.window.confidence_spin.value(), 0.50)
+        self.assertEqual(self.window.confidence_spin.value(), 0.20)
         self.assertEqual(self.window.selection_combo.currentData(), "confidence")
         self.assertEqual(json.loads(path.read_text()), legacy)
         self.window.ensure_project(allow_reconfigure=True)
@@ -354,6 +373,9 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(saved["manual.jpg"], records[0])
         self.assertEqual(saved["empty.jpg"], records[1])
         self.assertEqual(saved["auto.jpg"]["status"], "unlabeled")
+        config = json.loads(path.read_text())
+        self.assertEqual(config["confidence"], 0.20)
+        self.assertEqual(config["glove_selection_version"], ui.GLOVE_SELECTION_VERSION)
         backup = next(self.output.glob("backup_before_config_*"))
         self.assertEqual(json.loads((backup / "project.json").read_text()), legacy)
         self.assertEqual(load_records(backup / "review.jsonl")["manual.jpg"], records[0])

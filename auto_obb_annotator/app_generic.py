@@ -430,7 +430,7 @@ class GenericAnnotatorApp(QMainWindow):
         previous_image_button.clicked.connect(self.show_previous_image)
         next_image_button = QPushButton("下一张 [N]")
         next_image_button.clicked.connect(self.show_next_image)
-        empty_button = QPushButton("确认本张无目标 [Q]")
+        empty_button = QPushButton("确认无目标并下一张待复核 [Q]")
         empty_button.clicked.connect(self.mark_empty)
         clear_labels_button = QPushButton("删除本张标签并待重检 [Ctrl+Delete]")
         clear_labels_button.clicked.connect(self.clear_current_labels)
@@ -1183,8 +1183,9 @@ class GenericAnnotatorApp(QMainWindow):
         record = self.current_record()
         if record is not None:
             self.follow_check.setChecked(False)
-            self.save_review({**record, "objects": [], "status": "empty_confirmed",
-                              "reason": "人工确认区域内无目标"})
+            if self.save_review({**record, "objects": [], "status": "empty_confirmed",
+                                 "reason": "人工确认区域内无目标"}):
+                self.next_review()
 
     def clear_current_labels(self):
         """Persist an empty pending record so the current image can be detected again."""

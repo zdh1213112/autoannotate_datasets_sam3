@@ -50,19 +50,21 @@ LEFT_LABEL_COLOR = SELECTED_COLOR
 RIGHT_LABEL_COLOR = (255, 180, 0)  # cyan blue in BGR
 PENDING_SIDE_COLOR = (180, 90, 210)  # purple in BGR
 WORKFLOW = "gray_glove_lr_v2"
-GLOVE_SELECTION_VERSION = 1
-DEFAULT_CONFIDENCE = 0.50
+GLOVE_SELECTION_VERSION = 2
+DEFAULT_CONFIDENCE = 0.20
 
 
 def normalize_glove_config(config: dict) -> dict:
-    """Migrate old permissive defaults and enforce the two-glove limit."""
+    """Keep low-score proposals for review while limiting selected gloves."""
     result = {**config, "count_mode": "fixed",
               "target_count": (2 if config.get("count_mode") == "all" else
                                max(1, min(2, int(config.get("target_count", 2))))),
               "glove_selection_version": GLOVE_SELECTION_VERSION}
     if config.get("glove_selection_version", 0) < GLOVE_SELECTION_VERSION:
-        result["confidence"] = max(DEFAULT_CONFIDENCE,
-                                   float(config.get("confidence", DEFAULT_CONFIDENCE)))
+        confidence = float(config.get("confidence", DEFAULT_CONFIDENCE))
+        # Version 1 raised the detection cutoff to 0.50 and could hide real
+        # hands. Restore recall once, without changing other custom cutoffs.
+        result["confidence"] = DEFAULT_CONFIDENCE if confidence == 0.50 else confidence
         result["selection_rule"] = "confidence"
     return result
 
@@ -412,7 +414,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.count_spin.setRange(1, 2)
         self.count_spin.setValue(2)
         self.selection_combo.setCurrentIndex(self.selection_combo.findData("confidence"))
+        self.selection_combo.setToolTip(
+            "默认保留去重后置信度最高的两个框；低于复核阈值的框仍保留，供人工选择。")
         self.confidence_spin.setValue(DEFAULT_CONFIDENCE)
+        self.confidence_spin.setToolTip(
+            "候选检测门槛，默认 0.20，保留可能的真实手；低分框由复核阈值控制是否待人工确认。")
         self.review_reason_checks["class_conflict"].setChecked(False)
         self.review_reason_checks["near_edge"].setChecked(False)
         self.format_combo.setCurrentIndex(self.format_combo.findData("hbb"))
@@ -690,7 +696,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.update_sample_summary()
             if normalized != previous:
                 self.status.setText(
-                    "旧项目已调整为最多两只手套、按置信度选框；按 F5 备份并重检自动结果，保留人工确认。")
+                    f"旧项目已调整为最多两只手套、按置信度选框，检测门槛 {normalized['confidence']:.2f}；"
+                    "按 F5 备份并重检自动结果，保留人工确认。")
         self.set_classes(GRAY_GLOVE_CLASSES)
         self.set_config_controls(True)
 

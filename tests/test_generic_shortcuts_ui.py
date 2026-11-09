@@ -69,12 +69,32 @@ class GenericShortcutUITests(unittest.TestCase):
     def test_space_after_confirming_empty_moves_to_next_review(self):
         QTest.keyClick(self.window.table, Qt.Key_Q)
         self.assertEqual(self.window.records["a.png"]["status"], "empty_confirmed")
+        self.window.show_record("a.png")
         saved_before = (self.output / "review.jsonl").read_text()
         with patch.object(ui.QMessageBox, "information") as information:
             QTest.keyClick(self.window.table, Qt.Key_Space)
         information.assert_not_called()
         self.assertEqual(self.window.current_name, "c.png")
         self.assertEqual((self.output / "review.jsonl").read_text(), saved_before)
+
+    def test_q_saves_empty_and_immediately_moves_to_next_review(self):
+        QTest.keyClick(self.window.table, Qt.Key_Q)
+        self.assertEqual(self.window.current_name, "c.png")
+        saved = load_records(self.output / "review.jsonl")["a.png"]
+        self.assertEqual(saved["status"], "empty_confirmed")
+        self.assertEqual(saved["objects"], [])
+        self.assertTrue(all(not candidate["selected"] for candidate in saved["candidates"]))
+        self.assertFalse(self.window.follow_check.isChecked())
+        QTest.keyClick(self.window.table, Qt.Key_Q)
+        self.assertEqual(self.window.current_name, "c.png")
+        self.assertIn("没有待复核", self.window.status.text())
+
+    def test_q_does_not_advance_when_saving_empty_fails(self):
+        with patch.object(ui, "append_record", side_effect=OSError("disk full")), \
+                patch.object(ui.QMessageBox, "warning"):
+            QTest.keyClick(self.window.table, Qt.Key_Q)
+        self.assertEqual(self.window.current_name, "a.png")
+        self.assertEqual(self.window.records["a.png"]["status"], "review")
 
     def test_next_visible_and_typing_suppression(self):
         QTest.keyClick(self.window.table, Qt.Key_N)
