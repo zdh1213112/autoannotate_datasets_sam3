@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import secrets
@@ -14,15 +15,15 @@ import tempfile
 import cv2
 import numpy as np
 from PyQt5.QtCore import QCoreApplication, QLibraryInfo, QThread, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+from PyQt5.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox,
     QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+    QPushButton, QShortcut, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget, QDialog,
 )
 
-from .app import SAM3SemanticPredictor, SAM3TextSegmenter, UltralyticsModel, torch
+from .app import RotatableROILabel, SAM3SemanticPredictor, SAM3TextSegmenter, UltralyticsModel, torch
 from .app_barcode import SingleBoxDialog
 from .barcode_core import append_record, image_files, load_records
 from .button_shortcuts import ButtonShortcuts
@@ -118,8 +119,64 @@ def backup_project(output: Path) -> Path:
     return backup
 
 
+class UndoableBoxCanvas(RotatableROILabel):
+    """Keep the current dialog's frame edits separate from saved review undo."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._edit_history = []
+        self._mouse_before = None
+
+    def _snapshot(self):
+        return (list(self.rois), self._has_pending, self._cx, self._cy,
+                self._w, self._h, self._angle)
+
+    def _remember(self, before):
+        if before != self._snapshot():
+            self._edit_history.append(before)
+            if len(self._edit_history) > 100:
+                self._edit_history.pop(0)
+
+    def undo_edit(self):
+        if not self._edit_history:
+            return
+        (self.rois, self._has_pending, self._cx, self._cy,
+         self._w, self._h, self._angle) = self._edit_history.pop()
+        self._state = self._ST_IDLE
+        self._drag_handle = -1
+        self._mouse_before = None
+        self.rotation_changed.emit(self._angle)
+        self.update()
+
+    def mousePressEvent(self, event):
+        self._mouse_before = self._snapshot() if event.button() == Qt.LeftButton else None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and self._mouse_before is not None:
+            self._remember(self._mouse_before)
+            self._mouse_before = None
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Z and event.modifiers() & Qt.ControlModifier:
+            self.undo_edit()
+            event.accept()
+            return
+        before = self._snapshot()
+        super().keyPressEvent(event)
+        self._remember(before)
+
+    def clear_rois(self):
+        before = self._snapshot()
+        super().clear_rois()
+        self._remember(before)
+
+
 class GenericBoxDialog(SingleBoxDialog):
     """Add the review shortcuts to the existing rotated-box editor."""
+
+    canvas_type = UndoableBoxCanvas
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -128,6 +185,10 @@ class GenericBoxDialog(SingleBoxDialog):
         for button in self.findChildren(QPushButton):
             button.setText(labels[button.text()])
         self.button_shortcuts = ButtonShortcuts(self)
+        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.undo_shortcut.setContext(Qt.WindowShortcut)
+        self.undo_shortcut.setAutoRepeat(False)
+        self.undo_shortcut.activated.connect(self.canvas.undo_edit)
         self.canvas.setFocus()
 
 
@@ -221,6 +282,8 @@ class GenericThread(QThread):
 
 
 class GenericAnnotatorApp(QMainWindow):
+    previous_image_shortcut = "Shift+N"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("通用 SAM3 标注与人工复核")
@@ -236,6 +299,7 @@ class GenericAnnotatorApp(QMainWindow):
         self.segmenter = None
         self.sample_seed = secrets.randbits(64)
         self._deleted_during_run = set()
+        self._undo_stack = []
         self.preview_pixmap = None
         self._loading_objects = False
         self.config_locked = False
@@ -426,7 +490,7 @@ class GenericAnnotatorApp(QMainWindow):
         review_row = QHBoxLayout()
         confirm_button = QPushButton("确认并下一张待复核 [Space]")
         confirm_button.clicked.connect(self.confirm_current)
-        previous_image_button = QPushButton("上一张 [Shift+N]")
+        previous_image_button = QPushButton(f"上一张 [{self.previous_image_shortcut}]")
         previous_image_button.clicked.connect(self.show_previous_image)
         next_image_button = QPushButton("下一张 [N]")
         next_image_button.clicked.connect(self.show_next_image)
@@ -439,6 +503,11 @@ class GenericAnnotatorApp(QMainWindow):
         review_row.addWidget(next_image_button)
         review_row.addWidget(empty_button)
         review_row.addWidget(clear_labels_button)
+        self.undo_button = QPushButton("撤销上一步 [Ctrl+Z]")
+        self.undo_button.setEnabled(False)
+        self.undo_button.setToolTip("撤销当前会话最近一次人工标注操作，恢复对应图片。")
+        self.undo_button.clicked.connect(self.undo_last_review)
+        review_row.addWidget(self.undo_button)
         right_layout.addLayout(review_row)
         self.clear_all_button = QPushButton("删除目录全部标签并待重检 [Ctrl+Shift+R]")
         self.clear_all_button.clicked.connect(self.clear_all_labels)
@@ -601,6 +670,7 @@ class GenericAnnotatorApp(QMainWindow):
                                    if check.isChecked()]}
 
     def load_project(self):
+        self.clear_undo_history()
         path = self.output_dir() / "project.json"
         if not path.exists():
             self.sample_seed = secrets.randbits(64)
@@ -709,6 +779,7 @@ class GenericAnnotatorApp(QMainWindow):
                         review_path.unlink(missing_ok=True)
                     raise
                 self.records = updated
+                self.clear_undo_history()
             elif previous != config or needs_random_migration:
                 if not allow_reconfigure:
                     raise ValueError("配置已修改，请先按 F5 根据新配置重新检测，再导出。")
@@ -731,6 +802,7 @@ class GenericAnnotatorApp(QMainWindow):
                         review_path.unlink(missing_ok=True)
                     raise
                 self.records = updated
+                self.clear_undo_history()
                 self.sample_seed = config["sample_seed"]
                 self.current_name = None
                 self.clear_preview()
@@ -794,6 +866,7 @@ class GenericAnnotatorApp(QMainWindow):
                 backup_project(self.active_output)
             replace_review_records(self.active_output / "review.jsonl", updated)
             self.records = updated
+            self.clear_undo_history()
 
     def skipped_sampling_reason(self, percent):
         return f"未抽中：自动标注图片比例 {percent}%"
@@ -840,6 +913,7 @@ class GenericAnnotatorApp(QMainWindow):
              not has_duplicate_selected_boxes(record))
         }
         self._deleted_during_run.clear()
+        self.clear_undo_history()
         self.thread = self.make_detection_thread(sampled, config, done_names)
         self.thread.result_signal.connect(self.receive_result)
         self.thread.progress_signal.connect(self.update_progress)
@@ -877,6 +951,9 @@ class GenericAnnotatorApp(QMainWindow):
                 "confirmed", "empty_confirmed"}:
             return
         append_record(self.active_output / "review.jsonl", record)
+        self._undo_stack = [entry for entry in self._undo_stack
+                            if entry["name"] != record["name"]]
+        self._update_undo_button()
         self.records[record["name"]] = record
         self.update_table(record)
         self.update_counts()
@@ -1076,13 +1153,69 @@ class GenericAnnotatorApp(QMainWindow):
             return None
         return record
 
+    def _update_undo_button(self):
+        if hasattr(self, "undo_button"):
+            self.undo_button.setEnabled(bool(self._undo_stack))
+
+    def clear_undo_history(self):
+        """Undo is scoped to manual edits in the current project session."""
+        self._undo_stack.clear()
+        self._update_undo_button()
+
+    def undo_last_review(self):
+        if not self._undo_stack:
+            self.status.setText("当前没有可撤销的人工标注操作。")
+            return
+        entry = self._undo_stack[-1]
+        name = entry["name"]
+        if (self.active_output != entry["output"] or self.active_source != entry["source"]
+                or self.records.get(name) != entry["after"]):
+            self.clear_undo_history()
+            self.status.setText("记录或项目已改变，之前的撤销历史已失效。")
+            return
+        previous = copy.deepcopy(entry["before"])
+        try:
+            append_record(self.active_output / "review.jsonl", previous)
+        except OSError as exc:
+            QMessageBox.warning(self, "撤销失败", f"原标注未恢复，请重试：{exc}")
+            return
+        self._undo_stack.pop()
+        self._update_undo_button()
+        if self.thread is not None:
+            # Queued results can arrive even after the worker stopped running.
+            self._deleted_during_run.add(name)
+        self.records[name] = previous
+        self.follow_check.setChecked(False)
+        self.update_table(previous)
+        self.apply_filter()
+        row = self.row_for_name[name]
+        if self.table.isRowHidden(row):
+            self.review_filter.setChecked(False)
+            if hasattr(self, "search_edit"):
+                self.search_edit.clear()
+                self.status_filter.setCurrentIndex(self.status_filter.findData("all"))
+            self.apply_filter()
+        self.table.blockSignals(True)
+        self.table.selectRow(row)
+        self.table.scrollToItem(self.table.item(row, 0))
+        self.table.blockSignals(False)
+        self.show_record(name)
+        self.update_counts()
+        self.status.setText(f"已撤销 {name} 的上一步人工标注。")
+
     def save_review(self, record):
         record = sync_candidates(record)
+        previous = copy.deepcopy(self.records.get(record["name"]))
         try:
             append_record(self.active_output / "review.jsonl", record)
         except OSError as exc:
             QMessageBox.warning(self, "保存失败", f"当前结果未保存：{exc}")
             return False
+        if previous is not None and previous != record:
+            self._undo_stack.append({"name": record["name"], "before": previous,
+                                     "after": copy.deepcopy(record),
+                                     "source": self.active_source, "output": self.active_output})
+            self._update_undo_button()
         self.records[record["name"]] = record
         self.update_table(record)
         self.show_record(record["name"])
@@ -1233,6 +1366,7 @@ class GenericAnnotatorApp(QMainWindow):
             QMessageBox.warning(self, "清空失败", f"目录标签未全部清空：{exc}")
             return
         self.stop_detection()
+        self.clear_undo_history()
         self._deleted_during_run.update(names)
         self.follow_check.setChecked(False)
         self.records = updated

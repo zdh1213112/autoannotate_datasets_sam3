@@ -1,5 +1,6 @@
 """Exercise generic annotator shortcuts through real Qt key events."""
 
+import copy
 import os
 import json
 from pathlib import Path
@@ -65,6 +66,87 @@ class GenericShortcutUITests(unittest.TestCase):
         self.assertEqual(load_records(self.output / "review.jsonl")["a.png"]["status"],
                          "confirmed")
         self.assertFalse(self.window.follow_check.isChecked())
+
+    def test_undo_empty_confirmation_returns_to_image_and_persists(self):
+        before = copy.deepcopy(self.window.records["a.png"])
+        QTest.keyClick(self.window.table, Qt.Key_Q)
+        self.assertEqual(self.window.current_name, "c.png")
+        QTest.keyClick(self.window.table, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(self.window.current_name, "a.png")
+        self.assertEqual(self.window.records["a.png"], before)
+        self.assertEqual(load_records(self.output / "review.jsonl")["a.png"], before)
+        self.assertFalse(self.window.undo_button.isEnabled())
+
+    def test_multiple_undo_and_failed_write_keeps_history(self):
+        original = copy.deepcopy(self.window.records["a.png"])
+        self.window.toggle_candidate_at(30, 40)
+        intermediate = copy.deepcopy(self.window.records["a.png"])
+        self.window.mark_empty()
+        self.assertEqual(self.window.records["a.png"]["status"], "empty_confirmed")
+        with patch.object(ui, "append_record", side_effect=OSError("disk full")), \
+                patch.object(ui.QMessageBox, "warning"):
+            self.window.undo_last_review()
+        self.assertEqual(self.window.records["a.png"]["status"], "empty_confirmed")
+        self.assertEqual(len(self.window._undo_stack), 2)
+        self.window.undo_last_review()
+        self.assertEqual(self.window.records["a.png"], intermediate)
+        self.window.undo_last_review()
+        self.assertEqual(self.window.records["a.png"], original)
+        self.assertEqual(load_records(self.output / "review.jsonl")["a.png"], original)
+
+    def test_undo_does_not_overwrite_new_inference_result(self):
+        self.window.toggle_candidate_at(30, 40)
+        self.assertTrue(self.window.undo_button.isEnabled())
+        result = {"name": "a.png", "status": "review", "objects": [],
+                  "candidates": [], "candidate_count": 0, "reason": "新推理结果"}
+        self.window.receive_result(result)
+        self.assertFalse(self.window.undo_button.isEnabled())
+        self.window.undo_last_review()
+        self.assertEqual(load_records(self.output / "review.jsonl")["a.png"], result)
+
+    def test_undo_blocks_queued_results_after_worker_has_stopped(self):
+        original = copy.deepcopy(self.window.records["a.png"])
+        self.window.mark_empty()
+        thread = Mock()
+        thread.isRunning.return_value = False
+        self.window.thread = thread
+        self.window.undo_last_review()
+        self.assertIn("a.png", self.window._deleted_during_run)
+        self.window.receive_result({"name": "a.png", "status": "review",
+                                    "objects": [], "candidates": [],
+                                    "candidate_count": 0, "reason": "迟到的检测结果"})
+        self.assertEqual(load_records(self.output / "review.jsonl")["a.png"], original)
+        self.window.thread = None
+
+    def test_ctrl_z_in_text_input_does_not_undo_annotation(self):
+        self.window.mark_empty()
+        self.window.input_edit.setEnabled(True)
+        self.window.input_edit.setFocus()
+        self.window.input_edit.setText("hello")
+        QTest.keyClicks(self.window.input_edit, "x")
+        QTest.keyClick(self.window.input_edit, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(self.window.input_edit.text(), "hello")
+        self.assertEqual(self.window.records["a.png"]["status"], "empty_confirmed")
+        self.assertTrue(self.window.undo_button.isEnabled())
+
+    def test_box_dialog_ctrl_z_undoes_edit_without_rotating(self):
+        dialog = ui.GenericBoxDialog(
+            self.source / "a.png", "编辑框",
+            [[20, 25], [60, 25], [60, 95], [20, 95]], parent=self.window)
+        dialog.show()
+        dialog.activateWindow()
+        dialog.canvas.setFocus()
+        self.qt.processEvents()
+        original = dialog.canvas._snapshot()
+        QTest.keyClick(dialog.canvas, Qt.Key_Z)
+        self.assertNotEqual(dialog.canvas._angle, original[-1])
+        QTest.keyClick(dialog.canvas, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(dialog.canvas._snapshot(), original)
+        dialog.canvas.clear_rois()
+        self.assertFalse(dialog.canvas._has_pending)
+        QTest.keyClick(dialog.canvas, Qt.Key_Z, Qt.ControlModifier)
+        self.assertEqual(dialog.canvas._snapshot(), original)
+        dialog.close()
 
     def test_space_after_confirming_empty_moves_to_next_review(self):
         QTest.keyClick(self.window.table, Qt.Key_Q)

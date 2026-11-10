@@ -13,8 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import yaml
-from PyQt5.QtCore import QCoreApplication, QEvent, QLibraryInfo
+from PyQt5.QtCore import QCoreApplication, QEvent, QLibraryInfo, Qt
 from PyQt5.QtGui import QPixmap
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QScrollArea
 
 from auto_obb_annotator import app_gray_gloves as ui
@@ -278,6 +279,9 @@ class GrayGloveUITests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.output = self.root / "out"
+        state_patch = patch.object(ui, "SESSION_STATE_PATH", self.root / "review_session.json")
+        state_patch.start()
+        self.addCleanup(state_patch.stop)
         with patch.object(ui, "DEFAULT_OUTPUT", self.output):
             self.window = ui.GrayGloveAnnotatorApp()
         self.window.show()
@@ -314,6 +318,126 @@ class GrayGloveUITests(unittest.TestCase):
             self.window.interval_mode.findData("seconds"))
         self.assertEqual(self.window.interval_spin.value(), 1)
 
+    def test_reopening_restores_project_records_and_last_image(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        records = {}
+        for name, status in (("a.jpg", "confirmed"), ("b.jpg", "review"),
+                             ("c.jpg", "auto")):
+            record = {"name": name, "status": status, "objects": [],
+                      "candidates": [], "candidate_count": 0}
+            records[name] = record
+            append_record(self.output / "review.jsonl", record)
+        self.window.load_project()
+        self.window.table.selectRow(self.window.row_for_name["b.jpg"])
+        self.window.show_record("b.jpg")
+        before = (self.output / "review.jsonl").read_bytes()
+        self.window.close()
+        self.window.deleteLater()
+        self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
+        with patch.object(ui, "DEFAULT_OUTPUT", self.root / "other_default"):
+            self.window = ui.GrayGloveAnnotatorApp()
+        self.assertEqual(self.window.output_dir(), self.output)
+        self.assertEqual(self.window.current_name, "b.jpg")
+        self.assertEqual(self.window.records, records)
+        self.assertEqual(self.window.visible_count.text(), "显示 3/3 张")
+        self.assertEqual((self.output / "review.jsonl").read_bytes(), before)
+        self.assertIsNone(self.window.thread)
+
+    def test_manual_project_open_rejects_missing_source_without_switching(self):
+        source = self.root / "images"
+        source.mkdir()
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        invalid = self.root / "invalid"
+        invalid.mkdir()
+        (invalid / "review.jsonl").touch()
+        (invalid / "project.json").write_text(json.dumps({
+            "workflow": ui.WORKFLOW, "source_dir": str(self.root / "missing")}),
+            encoding="utf-8")
+        with patch.object(ui.QFileDialog, "getExistingDirectory", return_value=str(invalid)), \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.open_review_project()
+        self.assertIn("图片目录不存在", warning.call_args.args[2])
+        self.assertEqual(self.window.output_dir(), self.output)
+        self.assertEqual(self.window.active_source, source)
+
+    def test_manual_open_rejects_malformed_config_without_switching(self):
+        source = self.root / "images"
+        source.mkdir()
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        invalid = self.root / "invalid"
+        invalid.mkdir()
+        (invalid / "review.jsonl").touch()
+        (invalid / "project.json").write_text(json.dumps({
+            "workflow": ui.WORKFLOW, "source_dir": str(source)}), encoding="utf-8")
+        with patch.object(ui.QFileDialog, "getExistingDirectory", return_value=str(invalid)), \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.open_review_project()
+        warning.assert_called_once()
+        self.assertEqual(self.window.output_dir(), self.output)
+        self.assertEqual(self.window.active_output, self.output)
+        self.assertEqual(self.window.active_source, source)
+
+    def test_manual_project_open_loads_records_and_selects_review(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("auto.jpg", "review.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        for name, status in (("auto.jpg", "auto"), ("review.jpg", "review")):
+            append_record(self.output / "review.jsonl", {
+                "name": name, "status": status, "objects": [],
+                "candidates": [], "candidate_count": 0})
+        original = (self.output / "review.jsonl").read_bytes()
+        self.window.output_edit.setText(str(self.root / "other_output"))
+        self.window.load_project()
+        with patch.object(ui.QFileDialog, "getExistingDirectory", return_value=str(self.output)):
+            self.window.open_review_project()
+        self.assertEqual(self.window.output_dir(), self.output)
+        self.assertEqual(self.window.current_name, "review.jpg")
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual((self.output / "review.jsonl").read_bytes(), original)
+        self.assertIsNone(self.window.thread)
+
+    def test_corrupt_session_state_does_not_prevent_start_or_close(self):
+        self.window.close()
+        self.window.deleteLater()
+        self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
+        ui.SESSION_STATE_PATH.write_text("{broken", encoding="utf-8")
+        with patch.object(ui, "DEFAULT_OUTPUT", self.output):
+            self.window = ui.GrayGloveAnnotatorApp()
+        self.assertEqual(self.window.output_dir(), self.output)
+        self.assertIsNone(self.window.thread)
+        self.window.close()
+
+    def test_first_open_falls_back_to_existing_rectified_review_project(self):
+        source = self.root / "images"
+        source.mkdir()
+        cv2.imwrite(str(source / "one.jpg"), np.zeros((100, 200, 3), np.uint8))
+        rectified = self.root / "out_undistorted"
+        self.window.output_edit.setText(str(rectified))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        append_record(rectified / "review.jsonl", {
+            "name": "one.jpg", "status": "review", "objects": [],
+            "candidates": [], "candidate_count": 0})
+        self.window.close()
+        self.window.deleteLater()
+        self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
+        ui.SESSION_STATE_PATH.unlink(missing_ok=True)
+        with patch.object(ui, "DEFAULT_OUTPUT", self.output):
+            self.window = ui.GrayGloveAnnotatorApp()
+        self.assertEqual(self.window.output_dir(), rectified)
+        self.assertEqual(self.window.current_name, "one.jpg")
+        self.assertEqual(self.window.table.rowCount(), 1)
+
     def test_search_and_large_preview(self):
         for name, status in (("left_001.jpg", "review"),
                              ("right_002.jpg", "auto")):
@@ -330,6 +454,31 @@ class GrayGloveUITests(unittest.TestCase):
         dialog.zoom_spin.setValue(200)
         self.assertEqual(dialog.image_label.pixmap().width(), 400)
         dialog.close()
+
+    def test_b_views_previous_image_but_does_not_intercept_typing(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("a.jpg", "b.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        for name in ("a.jpg", "b.jpg"):
+            record = {"name": name, "status": "review", "objects": [],
+                      "candidates": [], "candidate_count": 0}
+            self.window.records[name] = record
+            self.window.update_table(record)
+        self.window.table.selectRow(self.window.row_for_name["b.jpg"])
+        self.window.show_record("b.jpg")
+        self.window.activateWindow()
+        self.window.table.setFocus()
+        self.qt.processEvents()
+        QTest.keyClick(self.window.table, Qt.Key_B)
+        self.assertEqual(self.window.current_name, "a.jpg")
+        self.window.search_edit.setFocus()
+        self.qt.processEvents()
+        QTest.keyClick(self.window.search_edit, Qt.Key_B)
+        self.assertEqual(self.window.search_edit.text(), "b")
+        self.assertEqual(self.window.current_name, "a.jpg")
 
     def test_project_config_tracks_prompts_and_model(self):
         source = self.root / "images"
@@ -384,6 +533,73 @@ class GrayGloveUITests(unittest.TestCase):
         saved = load_records(self.output / "review.jsonl")
         self.assertEqual(saved["manual.jpg"], records[0])
         self.assertEqual(saved["empty.jpg"], records[1])
+
+    def test_reopened_legacy_review_can_export_without_inference_or_migration(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("review.jpg", "auto.jpg", "manual.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        config_path = self.output / "project.json"
+        legacy = json.loads(config_path.read_text(encoding="utf-8"))
+        legacy.pop("glove_selection_version", None)
+        legacy.pop("review_score", None)
+        legacy.update(selection_rule="area", confidence=0.50)
+        config_path.write_text(json.dumps(legacy), encoding="utf-8")
+        config_before = config_path.read_bytes()
+        box = {"class_id": 0, "score": 0.9, "candidate_id": 0,
+               "polygon": [[20, 40], [50, 40], [50, 80], [20, 80]]}
+        records = {}
+        for name, status in (("review.jpg", "review"), ("auto.jpg", "auto"),
+                             ("manual.jpg", "confirmed")):
+            records[name] = {"name": name, "status": status, "objects": [dict(box)],
+                             "candidates": [{**box, "selected": True}],
+                             "candidate_count": 1, "side_pending": status == "review"}
+            append_record(self.output / "review.jsonl", records[name])
+        self.window.load_project()
+        self.window.close()
+        self.window.deleteLater()
+        self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
+        with patch.object(ui, "DEFAULT_OUTPUT", self.output):
+            self.window = ui.GrayGloveAnnotatorApp()
+        self.assertEqual(self.window.table.rowCount(), 3)
+        self.assertEqual(self.window.selection_combo.currentData(), "confidence")
+        self.window.show_record("review.jpg")
+        self.window.assign_current_side(1)
+        with patch.object(self.window, "make_detection_thread") as make, \
+                patch.object(ui.QMessageBox, "information") as information, \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.export()
+            information.assert_called_once()
+            warning.assert_not_called()
+            make.assert_not_called()
+        dataset = next(self.output.glob("yolo_hbb_*/dataset.yaml"))
+        self.assertTrue(dataset.is_file())
+        saved = load_records(self.output / "review.jsonl")
+        self.assertEqual(saved["review.jpg"]["status"], "confirmed")
+        self.assertEqual(saved["review.jpg"]["objects"][0]["class_id"], 1)
+        self.assertEqual(saved["auto.jpg"], records["auto.jpg"])
+        self.assertEqual(saved["manual.jpg"], records["manual.jpg"])
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertFalse(list(self.output.glob("backup_before_config_*")))
+
+        self.window.confidence_spin.setValue(0.35)
+        with patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.export()
+        self.assertIn("配置已修改", warning.call_args.args[2])
+        self.assertEqual(len(list(self.output.glob("yolo_hbb_*"))), 1)
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertEqual(load_records(self.output / "review.jsonl"), saved)
+
+        self.window.confidence_spin.setValue(0.20)
+        changed = json.loads(config_path.read_text())
+        changed["review_score"] = 0.65
+        config_path.write_text(json.dumps(changed), encoding="utf-8")
+        with patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.export()
+        self.assertIn("项目配置文件已改变", warning.call_args.args[2])
+        self.assertEqual(load_records(self.output / "review.jsonl"), saved)
 
     def test_review_only_recheck_preserves_other_records_and_shows_all(self):
         source = self.root / "images"
@@ -440,6 +656,7 @@ class GrayGloveUITests(unittest.TestCase):
         self.window.detection_finished()
         self.assertTrue(self.window.recheck_review_button.isEnabled())
         self.assertIn("1 张重检失败", self.window.status.text())
+        self.assertEqual(self.window.ensure_project()["selection_rule"], "confidence")
 
     def test_review_only_recheck_rejects_changed_source_and_missing_files(self):
         source = self.root / "images"

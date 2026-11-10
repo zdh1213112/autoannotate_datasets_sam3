@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -26,8 +27,12 @@ from .app_generic import (
     SELECTED_COLOR, UNSELECTED_COLOR,
 )
 from .barcode_core import image_files, load_records
-from .generic_core import detect_generic, normalize_review_reasons, sample_image_files
-from .generic_region import region_bounds
+from .generic_core import (
+    detect_generic, normalize_review_reasons, normalize_review_score,
+    normalize_sample_percent, normalize_sample_seed, normalize_selection_rule,
+    sample_image_files, validate_classes,
+)
+from .generic_region import normalize_region, region_bounds
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
 from .gray_glove_mcap import CAMERA_TOPICS, validate_mcap_files
 from .gray_glove_projection import (
@@ -38,6 +43,7 @@ from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
 DEFAULT_OUTPUT = ROOT_DIR / "data" / "gray_glove_lr_annotations"
+SESSION_STATE_PATH = ROOT_DIR / "data" / ".gray_glove_review_session.json"
 DEFAULT_ROI = [0.0, 0.0, 1.0, 1.0]
 GRAY_GLOVE_CLASSES = [
     {"name": "left", "prompt": "left hand wearing a light gray glove"},
@@ -390,6 +396,8 @@ class VideoFrameThread(QThread):
 class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     """Keep generic review tools while applying gray glove defaults."""
 
+    previous_image_shortcut = "B"
+
     def __init__(self):
         self._building_gray = True
         self.video_thread = None
@@ -398,6 +406,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self._loaded_video_folder = None
         self._review_recheck_names = None
         self._review_recheck_failures = []
+        self._resume_warning = None
+        self._loaded_review_ui_config = None
+        self._loaded_review_project_config = None
         self._visible_rows = 0
         self._run_started_at = None
         self._run_start_done = None
@@ -582,9 +593,15 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         video_layout.addLayout(undistort_row)
         outer = self.centralWidget().layout()
         outer.insertWidget(1, self.video_group)
+        self.open_project_button = QPushButton("打开已有复核项目 [Alt+P]")
+        self.open_project_button.setToolTip("选择包含 project.json 和 review.jsonl 的结果目录。")
+        self.open_project_button.clicked.connect(self.open_review_project)
         self.focus_button = QPushButton("进入大图复核 [Alt+S]")
         self.focus_button.clicked.connect(self.toggle_focus_view)
-        outer.insertWidget(0, self.focus_button)
+        focus_row = QHBoxLayout()
+        focus_row.addWidget(self.open_project_button)
+        focus_row.addWidget(self.focus_button)
+        outer.insertLayout(0, focus_row)
         self.video_shortcuts = []
         for key, button in (("Alt+V", self.video_button),
                             ("Alt+G", self.import_button)):
@@ -636,7 +653,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         for key, button in (("Alt+1", self.side_left_button),
                             ("Alt+2", self.side_right_button),
                             ("Alt+X", self.swap_button),
-                            ("Alt+S", self.focus_button)):
+                            ("Alt+S", self.focus_button),
+                            ("Alt+P", self.open_project_button)):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.WindowShortcut)
             shortcut.activated.connect(button.click)
@@ -646,16 +664,146 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         outer.insertWidget(outer.count() - 1, self.progress_detail)
         outer.insertWidget(outer.count() - 1, self.summary)
 
+        resume_output, resume_name = self.previous_review_project()
+        if resume_output is not None:
+            self.output_edit.setText(str(resume_output))
         self.load_project()
         self.set_config_controls(True)
         self.apply_filter()
         self.update_counts()
+        if self.active_output is not None:
+            self.resume_review_image(resume_name)
+        if self._resume_warning:
+            self.status.setText(self._resume_warning)
         content = self.takeCentralWidget()
         scroller = QScrollArea()
         scroller.setWidgetResizable(True)
         scroller.setWidget(content)
         self.setCentralWidget(scroller)
         self.resize(1500, 950)
+
+    @staticmethod
+    def review_project_error(output, validate_records=False):
+        """Check that an existing review project can be opened without inference."""
+        try:
+            output = Path(output).expanduser().resolve()
+            path = output / "project.json"
+            if not path.is_file() or not (output / "review.jsonl").is_file():
+                return "结果目录须包含 project.json 和 review.jsonl。"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(config, dict) or config.get("workflow") != WORKFLOW:
+                return "该结果目录不是灰色手套标注项目。"
+            raw_source = config["source_dir"]
+            if not isinstance(raw_source, str) or not raw_source.strip():
+                return "项目中的图片目录为空。"
+            source = Path(raw_source).expanduser().resolve()
+            if not source.is_dir():
+                return f"项目中的图片目录不存在：{source}"
+            if validate_records:
+                if normalize_region(config["roi"]) is None:
+                    return "项目中的检测区域无效。"
+                validate_classes(config["classes"])
+                normalize_review_reasons(config.get("review_reasons"))
+                normalize_review_score(config.get("review_score"))
+                normalize_selection_rule(config.get("selection_rule"))
+                normalize_sample_percent(config.get("sample_percent"))
+                if "sample_seed" in config:
+                    normalize_sample_seed(config["sample_seed"])
+                if config["count_mode"] not in {"fixed", "all"} or int(config["target_count"]) < 1:
+                    return "项目中的目标数量配置无效。"
+                if not np.isfinite(float(config["confidence"])):
+                    return "项目中的检测置信度无效。"
+                if config.get("side_mapping", "screen") not in {"screen", "mirror"}:
+                    return "项目中的左右手映射方式无效。"
+                settings = config.get("image_sampling")
+                if settings is not None and (not isinstance(settings, dict) or
+                        isinstance(settings.get("interval"), bool) or
+                        not isinstance(settings.get("interval"), int) or settings["interval"] < 1):
+                    return "项目中的图片抽样间隔无效。"
+                normalize_glove_config(config)
+                records = load_records(output / "review.jsonl")
+                if any(not isinstance(name, str) or not isinstance(record.get("status"), str)
+                       or not isinstance(record.get("objects", []), list)
+                       or not isinstance(record.get("candidates", []), list)
+                       for name, record in records.items()):
+                    return "复核记录格式无效，请检查 review.jsonl。"
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError) as exc:
+            return f"无法读取项目：{exc}"
+        return None
+
+    def previous_review_project(self):
+        """Restore the last opened review project, or an existing rectified project."""
+        try:
+            state = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("复核会话记录无效")
+            output = Path(state["output_dir"]).expanduser().resolve()
+            error = self.review_project_error(output, validate_records=True)
+            if error is None:
+                return output, state.get("current_name")
+            self._resume_warning = f"上次复核项目无法恢复：{error} 请打开已有复核项目。"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        default = Path(DEFAULT_OUTPUT).expanduser().resolve()
+        rectified = default.with_name(default.name + "_undistorted")
+        if (not (default / "project.json").exists()
+                and self.review_project_error(rectified, validate_records=True) is None):
+            return rectified, None
+        return None, None
+
+    def resume_review_image(self, preferred=None):
+        """Select the last visited image, or the first available review image."""
+        if self.active_source is None:
+            return
+        names = ([preferred] if isinstance(preferred, str) else [])
+        names += sorted(name for name, record in self.records.items()
+                        if record.get("status") == "review")
+        names += sorted(self.records)
+        for name in names:
+            if (name in self.row_for_name and Path(name).name == name
+                    and (self.active_source / name).is_file()):
+                self.follow_check.setChecked(False)
+                self.table.selectRow(self.row_for_name[name])
+                if self.current_name != name:
+                    self.show_record(name)
+                self.status.setText("已载入已有结果，可直接复核和微调标签。")
+                return
+
+    def remember_review_project(self):
+        """Persist only review navigation state; annotations remain in review.jsonl."""
+        if self.active_output is None or self.active_source is None:
+            return
+        try:
+            output = self.active_output.resolve()
+            if self.review_project_error(output) is not None:
+                return
+            SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            replace_project_config(SESSION_STATE_PATH, {
+                "output_dir": str(output), "current_name": self.current_name,
+            })
+        except OSError:
+            # This optional shortcut must never prevent saving or closing a project.
+            pass
+
+    def open_review_project(self):
+        if ((self.thread is not None and self.thread.isRunning()) or
+                (self.video_thread is not None and self.video_thread.isRunning())):
+            self.status.setText("请先停止当前任务，再打开已有项目。")
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "打开已有复核项目（选择结果目录）", self.output_edit.text().strip())
+        if not folder:
+            return
+        output = Path(folder).expanduser().resolve()
+        error = self.review_project_error(output, validate_records=True)
+        if error:
+            QMessageBox.warning(self, "无法打开复核项目", error)
+            return
+        self.output_edit.setText(str(output))
+        self.load_project()
+        if self.active_output == output:
+            self.resume_review_image()
+            self.remember_review_project()
 
     def config(self):
         config = super().config()
@@ -706,6 +854,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def load_project(self):
         if self._building_gray:
             return
+        self._loaded_review_ui_config = None
+        self._loaded_review_project_config = None
         self._visible_rows = 0
         path = self.output_dir() / "project.json"
         if path.is_file():
@@ -738,17 +888,49 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             if normalized != previous:
                 self.status.setText(
                     f"旧项目已调整为最多两只手套、按置信度选框，检测门槛 {normalized['confidence']:.2f}；"
-                    "按 F5 备份并重检自动结果，保留人工确认。")
+                    "可直接复核或导出已有结果；按 F5 将备份并重检自动结果。")
         self.set_classes(GRAY_GLOVE_CLASSES)
         self.set_config_controls(True)
+        if (path.is_file() and self.active_output == self.output_dir()
+                and self.review_project_error(self.active_output, validate_records=True) is None):
+            self._loaded_review_project_config = copy.deepcopy(previous)
+            self._loaded_review_ui_config = copy.deepcopy(self.config())
 
     def ensure_project(self, allow_reconfigure=False):
-        path = self.output_dir() / "project.json"
+        output = self.output_dir()
+        path = output / "project.json"
         if path.is_file():
             previous = json.loads(path.read_text(encoding="utf-8"))
             if previous.get("workflow") != WORKFLOW:
                 raise ValueError("结果目录属于其他标注任务，请另选目录")
-        return super().ensure_project(allow_reconfigure=allow_reconfigure)
+            if not allow_reconfigure and self._loaded_review_ui_config is not None:
+                if self.active_output != output:
+                    raise ValueError("结果目录已更改，请先载入对应项目。")
+                if self._loaded_review_project_config != previous:
+                    raise ValueError("项目配置文件已改变，请重新载入项目后再导出。")
+                if self._loaded_review_ui_config != self.config():
+                    raise ValueError("配置已修改，请先按 F5 根据新配置重新检测，再导出。")
+            # Loading an older project can normalize the displayed settings.  If
+            # the user has not changed them, export the already-saved results
+            # using the old project's sampling configuration without migration.
+            if (not allow_reconfigure and self._loaded_review_ui_config is not None
+                    and self._loaded_review_project_config == previous
+                    and self._loaded_review_ui_config == self.config()
+                    and self.active_output == self.output_dir()
+                    and self.active_source is not None
+                    and self.active_source.resolve() == self.source_dir()):
+                if not self.active_source.is_dir():
+                    raise ValueError(f"图片目录不存在: {self.active_source}")
+                if ("sample_seed" not in previous and
+                        normalize_sample_percent(previous.get("sample_percent")) < 100):
+                    raise ValueError("旧项目缺少随机抽样种子，无法确定原有抽样结果；请先按 F5 更新项目。")
+                self.records = load_records(self.active_output / "review.jsonl")
+                return self.active_config
+        config = super().ensure_project(allow_reconfigure=allow_reconfigure)
+        if allow_reconfigure and path.is_file():
+            self._loaded_review_project_config = json.loads(path.read_text(encoding="utf-8"))
+            self._loaded_review_ui_config = copy.deepcopy(self.config())
+        return config
 
     def records_after_config_change(self, files, previous, config):
         updated = super().records_after_config_change(files, previous, config)
@@ -768,6 +950,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
     def set_config_controls(self, enabled):
         super().set_config_controls(enabled)
+        if hasattr(self, "open_project_button"):
+            available = enabled and not (self.video_thread and self.video_thread.isRunning())
+            self.open_project_button.setEnabled(available)
         if hasattr(self, "recheck_review_button"):
             available = enabled and not (self.video_thread and self.video_thread.isRunning())
             self.recheck_review_button.setEnabled(available)
@@ -910,6 +1095,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
         self.records = records
         self.active_source, self.active_output, self.active_config = source, output, config
+        self._loaded_review_project_config = copy.deepcopy(config)
+        self._loaded_review_ui_config = copy.deepcopy(config)
         self.search_edit.clear()
         self.status_filter.setCurrentIndex(self.status_filter.findData("all"))
         self.review_filter.setChecked(False)
@@ -922,6 +1109,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.apply_filter()
         self._review_recheck_names = set(names)
         self._review_recheck_failures = []
+        self.clear_undo_history()
         self._run_started_at = time.monotonic()
         self._run_start_done = None
         self._deleted_during_run.clear()
@@ -1385,6 +1573,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.video_thread.stop()
             self.video_thread.wait()
         super().closeEvent(event)
+        if event.isAccepted():
+            self.remember_review_project()
 
 
 def main() -> int:

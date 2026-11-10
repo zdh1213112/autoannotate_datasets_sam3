@@ -50,7 +50,7 @@ class ButtonShortcuts(QObject):
             text_key = (
                 len(key) == 1
                 or (key.startswith("Shift+") and len(key) == len("Shift+") + 1)
-                or key in {"Space", "Delete", "Enter", "Ctrl+Delete", "Ctrl+Backspace"}
+                or key in {"Space", "Delete", "Enter", "Ctrl+Delete", "Ctrl+Backspace", "Ctrl+Z"}
             )
             shortcut.setEnabled((modal is None or modal is self.window)
                                 and not (typing and text_key))

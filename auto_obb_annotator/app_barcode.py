@@ -42,6 +42,8 @@ def _pixmap(image_bgr) -> QPixmap:
 class SingleBoxDialog(QDialog):
     """Edit one rotated rectangle; also used to select the fixed search ROI."""
 
+    canvas_type = RotatableROILabel
+
     def __init__(self, image_path: Path, title: str, initial=None, roi_mode=False,
                  parent=None):
         super().__init__(parent)
@@ -62,7 +64,7 @@ class SingleBoxDialog(QDialog):
         )
 
         layout = QVBoxLayout(self)
-        self.canvas = RotatableROILabel()
+        self.canvas = self.canvas_type()
         self.canvas.setPixmap(_pixmap(display))
         self.canvas.setFixedSize(display.shape[1], display.shape[0])
         layout.addWidget(self.canvas, alignment=Qt.AlignCenter)
