@@ -105,3 +105,24 @@ class OrbbecUndistortTests(unittest.TestCase):
         make_calibration(self.calibration, size=(100, 60))
         with self.assertRaisesRegex(ValueError, "实际画面"):
             OrbbecUndistorter([self.video])
+
+    def test_mask_and_image_reuse_exact_saved_projection(self):
+        rectifier = OrbbecUndistorter([self.video], balance=0.6)
+        metadata = rectifier.metadata[str(self.video)]
+        restored = OrbbecUndistorter.from_metadata(str(self.video), metadata)
+        mask = np.zeros((60, 80), np.uint8)
+        cv2.ellipse(mask, (60, 30), (14, 18), 20, 0, 360, 1, -1)
+        image = np.repeat((mask * 255)[:, :, None], 3, axis=2)
+        self.assertTrue(np.array_equal(rectifier(self.video, image), restored(self.video, image)))
+        projected = restored.remap_mask(str(self.video), mask)
+        maps = rectifier.maps_for(self.video, mask.shape)
+        expected = cv2.remap(mask, *maps, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        self.assertTrue(np.array_equal(projected, expected))
+        self.assertEqual(set(np.unique(projected)), {0, 1})
+        self.assertEqual(len(restored._maps), 1)
+
+    def test_changed_calibration_cannot_silently_move_labels(self):
+        rectifier = OrbbecUndistorter([self.video])
+        self.calibration.write_text(self.calibration.read_text() + "\n")
+        with self.assertRaisesRegex(ValueError, "标定文件已改变"):
+            OrbbecUndistorter.from_metadata(str(self.video), rectifier.metadata[str(self.video)])

@@ -744,6 +744,36 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(len(list((rectified_output / "video_frames" / "collection").glob("*.jpg"))), 1)
         self.assertEqual(load_records(self.output / "review.jsonl")["old.jpg"], old_record)
         self.assertEqual(self.window.video_target_dir(self.output), raw_source)
+        config = self.window.ensure_project()
+        self.assertEqual(config["undistorted_detection"], ui.PROJECTION_WORKFLOW)
+        folder = Path(config["source_dir"])
+        self.assertEqual(len(list((folder / "raw_frames").glob("*.png"))), 1)
+
+        # Upgrading an existing undistorted project must keep human decisions,
+        # even though the automatic detection space has changed to raw masks.
+        image = next(folder.glob("*.jpg"))
+        manual = {"name": image.name, "status": "confirmed", "objects": [
+            {"class_id": 0, "score": 1.0,
+             "polygon": [[20, 20], [40, 20], [40, 40], [20, 40]]}]}
+        append_record(rectified_output / "review.jsonl", manual)
+        legacy = dict(config)
+        legacy.pop("undistorted_detection")
+        project = rectified_output / "project.json"
+        project.write_text(json.dumps(legacy))
+        self.window.load_project()
+        self.assertEqual(json.loads(project.read_text()), legacy)
+        self.window.ensure_project(allow_reconfigure=True)
+        self.assertEqual(load_records(rectified_output / "review.jsonl")[image.name], manual)
+        backup = next(rectified_output.glob("backup_before_config_*"))
+        self.assertEqual(json.loads((backup / "project.json").read_text()), legacy)
+        # A review-only rerun can leave old automatic records behind. A later
+        # full F5 must still migrate those records, but never manual decisions.
+        self.window.records[image.name] = {**manual, "status": "auto"}
+        thread = self.window.make_detection_thread([image], self.window.config(), {image.name})
+        self.assertNotIn(image.name, thread.done_names)
+        self.window.records[image.name] = manual
+        thread = self.window.make_detection_thread([image], self.window.config(), {image.name})
+        self.assertIn(image.name, thread.done_names)
 
     def test_prompt_ensemble_merges_candidates_before_side_assignment(self):
         fake = [{"class_id": index, "box": [0, 0, 20, 20], "score": 0.9}

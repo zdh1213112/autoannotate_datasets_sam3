@@ -137,19 +137,65 @@ class OrbbecUndistorter:
                     "new_camera_matrix": new_matrix.tolist(),
                 }
 
-    def __call__(self, video: Path, frame: np.ndarray) -> np.ndarray:
+    @classmethod
+    def from_metadata(cls, source_key: str, metadata: dict):
+        """Reuse the exact saved projection, including its new camera matrix."""
+        path = Path(metadata["calibration_path"])
+        payload = path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != metadata["calibration_sha256"]:
+            raise ValueError(f"标定文件已改变，无法同步原图标签: {path}")
+        data = yaml.safe_load(payload)
+        camera_id = metadata["camera_id"]
+        camera = next((item for item in data["cameras"] if item["id"] == camera_id), None)
+        if camera is None or str(camera.get("distortion_model", "")).upper() != "KB":
+            raise ValueError(f"标定文件缺少有效的 {camera_id} KB 参数: {path}")
+        size = (int(camera["image_width"]), int(camera["image_height"]))
+        if list(size) != metadata["image_size"]:
+            raise ValueError("去畸变记录与标定分辨率不一致")
+        intr, dist = camera["intrinsics"], camera["distortion"]
+        matrix = np.array([[intr["fx"], 0, intr["cx"]],
+                           [0, intr["fy"], intr["cy"]], [0, 0, 1]], dtype=np.float64)
+        coefficients = np.array([dist[f"k{index}"] for index in range(1, 5)], dtype=np.float64)
+        new_matrix = np.asarray(metadata["new_camera_matrix"], dtype=np.float64)
+        if (new_matrix.shape != (3, 3) or not np.isfinite(new_matrix).all()
+                or not np.isfinite(matrix).all() or not np.isfinite(coefficients).all()
+                or min(matrix[0, 0], matrix[1, 1], new_matrix[0, 0], new_matrix[1, 1]) <= 0):
+            raise ValueError("去畸变记录中的相机参数无效")
+        instance = cls.__new__(cls)
+        instance.balance = float(metadata["balance"])
+        instance._maps = {}
+        instance._by_video = {source_key: (camera_id, size, matrix, coefficients,
+                                          new_matrix, metadata["calibration_sha256"])}
+        instance.metadata = {source_key: dict(metadata)}
+        return instance
+
+    def maps_for(self, video, shape):
+        """Return the shared output-to-input maps for images and masks."""
         source_key = (str(Path(video[0]).expanduser().resolve()) + "::" + video[1]
-                      if isinstance(video, tuple) else str(Path(video).expanduser().resolve()))
+                      if isinstance(video, tuple) else str(video))
+        if source_key not in self._by_video:
+            source_key = str(Path(video).expanduser().resolve())
         camera_id, size, matrix, coefficients, new_matrix, digest = self._by_video[source_key]
-        if (frame.shape[1], frame.shape[0]) != size:
+        if (shape[1], shape[0]) != size:
             raise ValueError(
-                f"{source_key} 的实际画面 {frame.shape[1]}×{frame.shape[0]} "
+                f"{source_key} 的实际画面 {shape[1]}×{shape[0]} "
                 f"与 {camera_id} 标定 {size[0]}×{size[1]} 不一致")
         key = (digest, camera_id, size, self.balance)
         if key not in self._maps:
             rotation = np.eye(3, dtype=np.float64)
             self._maps[key] = cv2.fisheye.initUndistortRectifyMap(
                 matrix, coefficients, rotation, new_matrix, size, cv2.CV_32FC1)
-        map_x, map_y = self._maps[key]
+        return self._maps[key]
+
+    def __call__(self, video: Path, frame: np.ndarray) -> np.ndarray:
+        map_x, map_y = self.maps_for(video, frame.shape)
         return cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT)
+
+    def remap_mask(self, video, mask: np.ndarray) -> np.ndarray:
+        """Use nearest-neighbor sampling to preserve a binary instance mask."""
+        if mask.ndim != 2:
+            raise ValueError("分割掩码必须为二维")
+        map_x, map_y = self.maps_for(video, mask.shape)
+        return cv2.remap((mask > 0).astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)

@@ -14,6 +14,7 @@ from auto_obb_annotator.gray_glove_video import (
     collect_videos, extract_video_batch, frame_camera_ids,
 )
 from auto_obb_annotator.orbbec_undistort import OrbbecUndistorter
+from auto_obb_annotator.gray_glove_projection import RawFrameReader
 
 
 HAS_MCAP = all(importlib.util.find_spec(name) is not None
@@ -109,3 +110,23 @@ class GrayGloveMcapTests(unittest.TestCase):
         self.assertEqual((count, reused), (3, 0))
         self.assertEqual(set(frame_camera_ids(folder).values()), {"cam_1"})
         self.assertEqual(cv2.imread(str(next(folder.glob("*.jpg")))).shape, (48, 64, 3))
+
+    def test_old_mcap_frames_recover_correct_camera_and_message_index(self):
+        rectifier = OrbbecUndistorter([self.mcap], mcap_camera_ids=("cam_0", "cam_1"))
+        folder, _, _ = extract_video_batch(
+            [self.mcap], self.root / "rectified", "frames", 2,
+            frame_transform=rectifier, transform_info=rectifier.metadata,
+            mcap_camera_ids=("cam_0", "cam_1"))
+        # Simulate an existing extraction made before raw caching was added.
+        for path in (folder / "raw_frames").glob("*.png"):
+            path.unlink()
+        reader = RawFrameReader(folder)
+        self.addCleanup(reader.close)
+        for image in sorted(folder.glob("*.jpg"), key=reader.sort_key):
+            entry = reader.entries[image.name]
+            raw, _, source_key = reader.load(image.name)
+            expected = (40 if entry["camera_id"] == "cam_0" else 130) + entry["source_frame"]
+            self.assertAlmostEqual(float(raw.mean()), expected, delta=1)
+            self.assertTrue(source_key.endswith("::" + entry["topic"]))
+        self.assertEqual(len(reader._mcap_readers), 2)
+        self.assertEqual(len(list((folder / "raw_frames").glob("*.png"))), 6)

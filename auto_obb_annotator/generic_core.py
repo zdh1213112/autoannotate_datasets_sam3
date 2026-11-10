@@ -144,7 +144,7 @@ def validate_classes(classes: list[dict]) -> list[dict]:
     return result
 
 
-def _polygon_from_mask(mask, box, height: int, width: int):
+def _polygon_from_mask(mask, box, height: int, width: int, pad_mask: bool = True):
     try:
         x1, y1, x2, y2 = [float(value) for value in box]
     except (TypeError, ValueError):
@@ -165,8 +165,8 @@ def _polygon_from_mask(mask, box, height: int, width: int):
         points = cv2.findNonZero(restricted)
     if points is not None and len(points) >= 15:
         center, size, angle = cv2.minAreaRect(points)
-        polygon = cv2.boxPoints((center, (size[0] * 1.04 + 2,
-                                                size[1] * 1.04 + 2), angle))
+        fitted_size = (size[0] * 1.04 + 2, size[1] * 1.04 + 2) if pad_mask else size
+        polygon = cv2.boxPoints((center, fitted_size, angle))
     else:
         polygon = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
                            dtype=np.float32)
@@ -219,7 +219,8 @@ def select_detections(image, roi, detections: list[dict], class_count: int,
         if not 0 <= class_id < class_count or not np.isfinite(score):
             continue
         polygon = _polygon_from_mask(
-            detection.get("mask"), detection["box"], crop_height, crop_width)
+            detection.get("mask"), detection["box"], crop_height, crop_width,
+            pad_mask=detection.get("pad_mask", True))
         if polygon is None:
             continue
         polygon += np.array([x1, y1], dtype=np.float32)

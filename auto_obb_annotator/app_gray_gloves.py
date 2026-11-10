@@ -30,6 +30,9 @@ from .generic_core import detect_generic, normalize_review_reasons, sample_image
 from .generic_region import region_bounds
 from .gray_glove_video import collect_videos, extract_video_batch, frame_camera_ids
 from .gray_glove_mcap import CAMERA_TOPICS, validate_mcap_files
+from .gray_glove_projection import (
+    PROJECTION_WORKFLOW, ProjectedGloveSegmenter, RawFrameReader, frame_projection_sources,
+)
 from .orbbec_undistort import OrbbecUndistorter
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
@@ -250,6 +253,7 @@ class GrayGloveSegmenter(GenericSAM3Segmenter):
 
 class GrayGloveThread(GenericThread):
     def run(self):
+        raw_reader = None
         try:
             self.config = normalize_glove_config(self.config)
             todo = [path for path in self.files if path.name not in self.done_names]
@@ -260,6 +264,11 @@ class GrayGloveThread(GenericThread):
             if not todo:
                 self.message_signal.emit("抽中图片已有结果；可复核或导出。")
                 return
+            raw_reader = RawFrameReader(Path(self.config["source_dir"]), lambda: self.running)
+            # MCAP H264 needs sequential decoding from a keyframe. Sorting the
+            # sampled subset avoids restarting the decoder for every image.
+            if raw_reader.entries:
+                todo.sort(key=raw_reader.sort_key)
             device = "cuda:0" if torch is not None and torch.cuda.is_available() else "cpu"
             if self.segmenter is None or self.segmenter.device != device:
                 self.message_signal.emit(f"正在加载 SAM3（{device}），待检测 {len(todo)} 张...")
@@ -280,13 +289,19 @@ class GrayGloveThread(GenericThread):
                     auto_side = (self.config.get("auto_side", True)
                                  and camera_id in SIDE_CAMERA_CLASS)
                     self.segmenter.side_prompts_enabled = auto_side
+                    detector = self.segmenter
+                    if path.name in raw_reader.entries:
+                        raw_image, rectifier, source_key = raw_reader.load(path.name)
+                        detector = ProjectedGloveSegmenter(
+                            self.segmenter, raw_image, rectifier, source_key,
+                            self.config["roi"], image.shape)
                     review_reasons = normalize_review_reasons(
                         self.config.get("review_reasons"))
                     if auto_side:
                         review_reasons = [reason for reason in review_reasons
                                           if reason != "short_count"]
                     result = detect_generic(
-                        image, self.config["roi"], self.segmenter,
+                        image, self.config["roi"], detector,
                         self.config["classes"], self.config["count_mode"],
                         self.config["target_count"],
                         review_reasons,
@@ -296,7 +311,7 @@ class GrayGloveThread(GenericThread):
                         x1, y1, _x2, _y2 = region_bounds(
                             self.config["roi"], image.shape[1], image.shape[0])
                         result = attach_side_scores(
-                            result, self.segmenter.last_side_detections, (x1, y1))
+                            result, detector.last_side_detections, (x1, y1))
                         result["side_auto_attempted"] = True
                     result = assign_glove_sides(
                         result, image.shape[1],
@@ -306,6 +321,11 @@ class GrayGloveThread(GenericThread):
                         result, camera_id)
                     result.update(name=path.name, width=image.shape[1],
                                   height=image.shape[0])
+                    if path.name in raw_reader.entries:
+                        source = raw_reader.entries[path.name]
+                        result.update(detection_space=PROJECTION_WORKFLOW,
+                                      source_key=source["source_key"],
+                                      source_frame=source["source_frame"])
                 except Exception as exc:
                     result = {"name": path.name, "objects": [], "candidates": [],
                               "status": "review", "reason": f"检测失败: {exc}",
@@ -317,6 +337,9 @@ class GrayGloveThread(GenericThread):
                 "检测已停止。" if not self.running else "检测完成，请检查待复核图片。")
         except Exception as exc:
             self.message_signal.emit(f"灰色手套检测无法启动: {exc}")
+        finally:
+            if raw_reader is not None:
+                raw_reader.close()
 
 
 class VideoFrameThread(QThread):
@@ -551,6 +574,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.balance_spin.setToolTip("0 减少黑边并让手更大；1 保留更宽视野，可能有大片黑边。")
         undistort_row.addWidget(self.balance_spin)
         self.undistort_button = QPushButton("按当前设置去畸变抽帧并载入")
+        self.undistort_button.setToolTip(
+            "保留原始帧；检测时 SAM3 在原图分割，再将掩码同步去畸变并重新生成标签框。")
         self.undistort_button.clicked.connect(
             lambda: self.import_video(undistort=True))
         undistort_row.addWidget(self.undistort_button)
@@ -642,6 +667,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
                 and self.image_interval_spin.value() != 1):
             config["image_sampling"] = self.image_sampling_settings()
         config["glove_selection_version"] = GLOVE_SELECTION_VERSION
+        if frame_projection_sources(Path(config["source_dir"])):
+            config["undistorted_detection"] = PROJECTION_WORKFLOW
         return normalize_glove_config(config)
 
     def image_sampling_settings(self):
@@ -774,6 +801,14 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
 
     def make_detection_thread(self, files, config, done_names):
         config = {**config, "auto_side": self.auto_side_check.isChecked()}
+        if config.get("undistorted_detection") == PROJECTION_WORKFLOW:
+            projected_names = frame_projection_sources(Path(config["source_dir"]))
+            done_names = set(done_names) - {
+                name for name, record in self.records.items()
+                if name in projected_names and
+                record.get("status") not in {"confirmed", "empty_confirmed"} and
+                record.get("detection_space") != PROJECTION_WORKFLOW
+            }
         done_names = set(done_names) - {
             name for name, record in self.records.items()
             if len(record.get("objects", [])) > 2 and

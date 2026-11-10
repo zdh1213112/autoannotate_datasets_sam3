@@ -20,6 +20,26 @@ from .gray_glove_mcap import CAMERA_TOPICS, iter_mcap_frames, probe_mcap, valida
 VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mcap"})
 
 
+def raw_frame_path(folder: Path, name: str) -> Path:
+    if Path(name).name != name:
+        raise ValueError("抽帧图片名称无效")
+    return Path(folder) / "raw_frames" / Path(name).with_suffix(".png")
+
+
+def cache_raw_frame(folder: Path, name: str, image) -> Path:
+    """Cache only selected raw frames, losslessly and outside the image list."""
+    destination = raw_frame_path(folder, name)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.png")
+    try:
+        if not cv2.imwrite(str(temporary), image):
+            raise OSError(f"无法保存原始帧缓存: {destination}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def frame_camera_ids(folder: Path) -> dict[str, str]:
     """Read source-camera IDs from batch manifests when available."""
     result = {}
@@ -223,6 +243,7 @@ def extract_video_batch(videos, output: Path, interval_mode: str,
                 if not ok or image is None:
                     raise ValueError(f"视频第 {index} 帧无法解码: {video}")
                 if frame_transform is not None:
+                    cache_raw_frame(target, name, image)
                     image = frame_transform(video, image)
                 temporary = target / f".{name}.{uuid.uuid4().hex}.jpg"
                 try:
@@ -340,6 +361,7 @@ def _extract_mcap_batch(mcap, output, interval_mode, interval_value,
                 if hasattr(image, "to_ndarray"):
                     image = image.to_ndarray(format="bgr24")
                 if frame_transform is not None:
+                    cache_raw_frame(target, name, image)
                     image = frame_transform((mcap, topic), image)
                 temporary = target / f".{name}.{uuid.uuid4().hex}.jpg"
                 try:
