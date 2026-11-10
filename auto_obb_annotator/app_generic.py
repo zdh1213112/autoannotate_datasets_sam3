@@ -1469,7 +1469,8 @@ class GenericAnnotatorApp(QMainWindow):
         )
         QMessageBox.information(self, "导出完成",
                                 f"数据集：{target}\n待复核/待重检未导出：{unresolved} 张"
-                                f"\n未抽中未导出：{skipped} 张")
+                                f"\n未抽中未导出：{skipped} 张"
+                                f"\n可视化预览：{target / 'visualizations'}")
 
     def closeEvent(self, event):
         if self.thread:

@@ -13,6 +13,7 @@ import shutil
 import cv2
 import numpy as np
 
+from .dataset_preview import write_dataset_previews
 from .generic_region import (
     crop_region, polygon_in_region, region_bounds, region_near_edge,
 )
@@ -410,4 +411,5 @@ def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
         f"nc: {len(classes)}\nnames:\n{names_yaml}\n",
         encoding="utf-8",
     )
+    write_dataset_previews(target, selected, classes, box_format, val_names)
     return target, annotated_images, object_count

@@ -293,6 +293,107 @@ class GrayGloveUITests(unittest.TestCase):
         self.qt.sendPostedEvents(None, QEvent.DeferredDelete)
         self.qt.processEvents()
 
+    def make_orbbec_input(self, with_calibration=True):
+        video = self.root / "EGO_camera_left.mp4"
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (80, 60))
+        self.assertTrue(writer.isOpened())
+        image = np.zeros((60, 80, 3), np.uint8)
+        image[:, :, 0] = np.arange(80, dtype=np.uint8) * 3
+        image[:, :, 1] = np.arange(60, dtype=np.uint8)[:, None] * 4
+        cv2.circle(image, (60, 40), 9, (20, 50, 240), -1)
+        for _ in range(10):
+            writer.write(image)
+        writer.release()
+        if with_calibration:
+            (self.root / "EGO_calibration_camera.yaml").write_text(yaml.safe_dump({"cameras": [{
+                "id": "cam_0", "distortion_model": "KB", "image_width": 80, "image_height": 60,
+                "intrinsics": {"fx": 45, "fy": 45, "cx": 40, "cy": 30},
+                "distortion": {"k1": 0.08, "k2": -0.01, "k3": 0.001, "k4": 0},
+            }]}), encoding="utf-8")
+        return video
+
+    def finish_import(self):
+        deadline = time.monotonic() + 10
+        while self.window.video_thread is not None and time.monotonic() < deadline:
+            self.qt.processEvents()
+            time.sleep(0.01)
+        self.qt.processEvents()
+        self.assertIsNone(self.window.video_thread)
+
+    def test_ordinary_button_loads_corrected_preview_and_preserves_raw_for_sam(self):
+        video = self.make_orbbec_input()
+        self.window.add_video_paths([video])
+        # Exercise the actual clicked(bool) signal, not only the Python method.
+        self.window.import_button.click()
+        self.finish_import()
+        self.assertEqual(self.window.output_dir(), self.root / "out_undistorted")
+        folder = self.window.source_dir()
+        image = next(folder.glob("*.jpg"))
+        corrected = cv2.imread(str(image))
+        raw = cv2.imread(str(folder / "raw_frames" / image.with_suffix(".png").name))
+        self.assertGreater(float(np.mean(cv2.absdiff(raw, corrected))), 1.0)
+        config = self.window.ensure_project()
+        self.assertEqual(config["undistorted_detection"], ui.PROJECTION_WORKFLOW)
+        record = {"name": image.name, "status": "empty_confirmed", "objects": [],
+                  "candidates": [], "candidate_count": 0}
+        self.window.records[image.name] = record
+        self.window.show_record(image.name)
+        self.assertEqual(self.window.preview_pixmap.toImage().pixelColor(60, 35).getRgb()[:3],
+                         tuple(int(value) for value in corrected[35, 60, ::-1]))
+        with patch.object(ui.GenericAnnotatorApp, "start_detection") as detect, \
+                patch.object(self.window, "import_video") as extract:
+            self.window.start_detection()
+            detect.assert_called_once()
+            extract.assert_not_called()
+
+    def test_f5_upgrades_old_raw_extraction_in_separate_project(self):
+        video = self.make_orbbec_input()
+        folder, _, _ = extract_video_batch([video], self.output, "frames", 2, end_seconds=0.6)
+        self.window.input_edit.setText(str(folder))
+        self.window.sync_video_sources()
+        self.window.interval_mode.setCurrentIndex(self.window.interval_mode.findData("frames"))
+        self.window.interval_spin.setValue(2)
+        self.window.end_check.setChecked(True)
+        self.window.end_spin.setValue(0.6)
+        self.window.ensure_project()
+        first = next(folder.glob("*.jpg"))
+        manual = {"name": first.name, "status": "confirmed", "objects": [
+            {"class_id": 0, "score": 1.0, "polygon": [[20, 20], [40, 20], [40, 40], [20, 40]]}]}
+        append_record(self.output / "review.jsonl", manual)
+        before_labels = (self.output / "review.jsonl").read_bytes()
+        before_config = (self.output / "project.json").read_bytes()
+        before_image = first.read_bytes()
+        with patch.object(ui.GenericAnnotatorApp, "start_detection") as detect:
+            self.window.start_detection()
+            self.finish_import()
+            detect.assert_called_once()
+        self.assertEqual(self.window.output_dir(), self.root / "out_undistorted")
+        self.assertTrue(ui.frame_projection_sources(self.window.source_dir()))
+        self.assertEqual(len(list(self.window.source_dir().glob("*.jpg"))), 3)
+        self.assertEqual((self.output / "review.jsonl").read_bytes(), before_labels)
+        self.assertEqual((self.output / "project.json").read_bytes(), before_config)
+        self.assertEqual(first.read_bytes(), before_image)
+
+    def test_known_four_camera_video_without_calibration_does_not_fall_back_to_raw(self):
+        video = self.make_orbbec_input(with_calibration=False)
+        self.window.add_video_paths([video])
+        with patch.object(ui.QMessageBox, "warning") as warning, \
+                patch.object(ui.GenericAnnotatorApp, "start_detection") as detect:
+            self.window.start_detection()
+            self.finish_import()
+            warning.assert_called_once()
+            self.assertIn("标定", warning.call_args.args[2])
+            detect.assert_not_called()
+        self.assertFalse(self.window.input_edit.text())
+        self.assertFalse((self.output / "video_frames").exists())
+
+    def test_mcap_and_named_cameras_use_the_same_default_route(self):
+        self.assertTrue(self.window.should_undistort_videos([Path("recording.mcap")]))
+        self.assertTrue(self.window.should_undistort_videos([Path("EGO_camera_right.mp4")]))
+        self.assertFalse(self.window.should_undistort_videos([Path("ordinary.mp4")]))
+        with self.assertRaisesRegex(ValueError, "分批"):
+            self.window.should_undistort_videos([Path("recording.mcap"), Path("ordinary.mp4")])
+
     def test_gray_glove_defaults_and_independent_project(self):
         self.assertEqual(self.window.classes(), ui.GRAY_GLOVE_CLASSES)
         self.assertEqual(self.window.roi, [0.0, 0.0, 1.0, 1.0])
@@ -946,7 +1047,7 @@ class GrayGloveUITests(unittest.TestCase):
         self.window.video_edit.setText(str(video))
         self.window.end_check.setChecked(True)
         self.window.end_spin.setValue(0.2)
-        self.window.import_video(undistort=True)
+        self.window.import_button.click()
         deadline = time.monotonic() + 10
         while self.window.video_thread is not None and time.monotonic() < deadline:
             self.qt.processEvents()

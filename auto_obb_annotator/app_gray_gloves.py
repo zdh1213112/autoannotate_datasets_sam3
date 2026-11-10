@@ -38,7 +38,7 @@ from .gray_glove_mcap import CAMERA_TOPICS, validate_mcap_files
 from .gray_glove_projection import (
     PROJECTION_WORKFLOW, ProjectedGloveSegmenter, RawFrameReader, frame_projection_sources,
 )
-from .orbbec_undistort import OrbbecUndistorter
+from .orbbec_undistort import OrbbecUndistorter, camera_id_for_video
 from .project_paths import ROOT_DIR, SAM3_MODEL
 
 
@@ -561,7 +561,10 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.end_check.toggled.connect(self.end_spin.setEnabled)
         interval_row.addWidget(self.end_spin)
         self.import_button = QPushButton("抽帧并载入 [Alt+G]")
-        self.import_button.clicked.connect(self.import_video)
+        # clicked(bool) must not be mistaken for the detect-after flag.
+        self.import_button.clicked.connect(lambda: self.import_video())
+        self.import_button.setToolTip(
+            "四目录像默认去畸变，并保留原图供 SAM3 分割；完成后按 F5 检测。")
         interval_row.addWidget(self.import_button)
         self.video_progress = QLabel("尚未抽帧；也可直接选择已有图片目录")
         interval_row.addWidget(self.video_progress, 1)
@@ -584,12 +587,6 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.balance_spin.setValue(0.0)
         self.balance_spin.setToolTip("0 减少黑边并让手更大；1 保留更宽视野，可能有大片黑边。")
         undistort_row.addWidget(self.balance_spin)
-        self.undistort_button = QPushButton("按当前设置去畸变抽帧并载入")
-        self.undistort_button.setToolTip(
-            "保留原始帧；检测时 SAM3 在原图分割，再将掩码同步去畸变并重新生成标签框。")
-        self.undistort_button.clicked.connect(
-            lambda: self.import_video(undistort=True))
-        undistort_row.addWidget(self.undistort_button)
         video_layout.addLayout(undistort_row)
         outer = self.centralWidget().layout()
         outer.insertWidget(1, self.video_group)
@@ -972,8 +969,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
                            self.interval_mode, self.image_interval_spin,
                            self.interval_spin, self.start_spin, self.end_check,
                            self.import_button, self.calibration_edit,
-                           self.calibration_button, self.balance_spin,
-                           self.undistort_button):
+                           self.calibration_button, self.balance_spin):
                 widget.setEnabled(available)
             for widget in (self.video_edit, self.video_button, self.folder_button,
                            self.add_path_button, self.remove_video_button,
@@ -1157,6 +1153,20 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if not has_images:
             QMessageBox.warning(self, "无法开始", "请选择图片目录或添加视频 / MCAP。")
             return
+        if (self._loaded_video_folder is not None and
+                not frame_projection_sources(self.source_dir())):
+            # Upgrade raw extractions made through the old ordinary button.
+            # Keep their images and labels in the original project directory.
+            videos = [Path(self.video_list.item(index).text())
+                      for index in range(self.video_list.count())]
+            try:
+                rectify = self.should_undistort_videos(videos)
+            except ValueError as exc:
+                QMessageBox.warning(self, "无法开始", str(exc))
+                return
+            if rectify:
+                self.import_video(detect_after=True)
+                return
         self._run_started_at = time.monotonic()
         self._run_start_done = None
         self._visible_rows = 0
@@ -1478,7 +1488,24 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             return output.with_name(output.name[:-len(suffix)])
         return output
 
-    def import_video(self, undistort: bool = False, detect_after: bool = False):
+    @staticmethod
+    def should_undistort_videos(videos) -> bool:
+        """Default known four-camera recordings to the synchronized workflow."""
+        supported = []
+        for video in videos:
+            if video.suffix.lower() == ".mcap":
+                supported.append(True)
+            else:
+                try:
+                    camera_id_for_video(video)
+                    supported.append(True)
+                except ValueError:
+                    supported.append(False)
+        if any(supported) and not all(supported):
+            raise ValueError("四目录像与普通视频请分批抽帧。")
+        return bool(supported) and all(supported)
+
+    def import_video(self, detect_after: bool = False):
         if self.thread is not None and self.thread.isRunning():
             self.status.setText("请先停止自动检测，再切换视频。")
             return
@@ -1490,6 +1517,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             if not sources and self.video_edit.text().strip():
                 sources = [self.video_edit.text().strip()]
             videos = collect_videos(sources)
+            undistort = self.should_undistort_videos(videos)
             validate_mcap_files(video for video in videos if video.suffix.lower() == ".mcap")
             mcap_camera_ids = tuple(camera_id for camera_id in CAMERA_TOPICS
                                     if self.mcap_camera_checks[camera_id].isChecked())
@@ -1523,7 +1551,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.video_thread.start()
 
     def update_video_progress(self, done, total):
-        self.video_progress.setText(f"抽帧 {done}/{total} 张")
+        action = "去畸变抽帧" if self.video_thread and self.video_thread.undistort else "原图抽帧"
+        self.video_progress.setText(f"{action} {done}/{total} 张")
 
     def video_imported(self, folder, count, reused, output):
         self._video_import_succeeded = True
@@ -1541,7 +1570,9 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.update_sample_summary()
         next_step = "即将开始检测" if self._detect_after_video_import else "按 F5 开始标注"
         self.video_progress.setText(f"{action}完成 {count} 张（复用 {reused} 张）；{next_step}")
-        self.status.setText(f"图片目录已切换到 {folder}；{next_step}。")
+        mode = ("原图分割 → 掩码去畸变 → 去畸变图复核"
+                if self.video_thread and self.video_thread.undistort else "原图检测与复核")
+        self.status.setText(f"图片目录已切换到 {folder}；{mode}；{next_step}。")
 
     def video_import_error(self, message):
         self.video_progress.setText(message)
