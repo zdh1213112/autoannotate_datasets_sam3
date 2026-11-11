@@ -112,26 +112,37 @@ def _draw_preview(image_path, label_path, classes, box_format, subset):
     return canvas
 
 
-def write_dataset_previews(target, records, classes, box_format, val_names):
+def write_dataset_previews(target, records, classes, box_format, val_names, *,
+                           progress=None, should_continue=None):
     """Write up to ten annotated images, a contact sheet and a sample index."""
-    samples = choose_preview_records(records, val_names)
+    flat = val_names is None
+    samples = choose_preview_records(records, val_names or set())
     folder = target / "visualizations"
     folder.mkdir()
     thumbs, lines = [], []
-    for record in samples:
+    if progress is not None:
+        progress(0, len(samples))
+    for done, record in enumerate(samples, 1):
+        if should_continue is not None and not should_continue():
+            raise InterruptedError("已取消导出")
         name = record["name"]
-        subset = "val" if name in val_names else "train"
+        subset = "" if flat else "val" if name in val_names else "train"
         image = target / "images" / subset / name
         label = target / "labels" / subset / f"{Path(name).stem}.txt"
-        filename = f"{subset}__{Path(name).stem}.jpg"
-        preview = _draw_preview(image, label, classes, box_format, subset)
+        group = subset or "all"
+        filename = f"{group}__{Path(name).stem}.jpg"
+        preview = _draw_preview(image, label, classes, box_format, group)
         preview.save(folder / filename, quality=92)
         preview.thumbnail((480, 340))
         thumbs.append(preview)
         lines.append(
-            f"| [{name}]({quote(filename)}) | {subset} | "
-            f"[原图]({quote('../images/' + subset + '/' + name)}) | "
-            f"[标签]({quote('../labels/' + subset + '/' + Path(name).stem + '.txt')}) |")
+            f"| [{name}]({quote(filename)}) | {group} | "
+            f"[原图]({quote('../' + image.relative_to(target).as_posix())}) | "
+            f"[标签]({quote('../' + label.relative_to(target).as_posix())}) |")
+        if progress is not None:
+            progress(done, len(samples))
+    if should_continue is not None and not should_continue():
+        raise InterruptedError("已取消导出")
     columns = min(2, len(thumbs))
     rows = math.ceil(len(thumbs) / columns)
     overview = Image.new("RGB", (columns * 492 + 12, rows * 352 + 12), (40, 44, 50))
@@ -141,13 +152,17 @@ def write_dataset_previews(target, records, classes, box_format, val_names):
         overview.paste(thumb, (x, y))
     overview.save(folder / "overview.jpg", quality=92)
     class_lines = "\n".join(f"- `{index}`: {spec['name']}" for index, spec in enumerate(classes))
+    coverage = ("类别、相机视角及无目标样本" if flat else
+                "训练/验证集、类别、相机视角及无目标样本")
+    usage = ("图片和当前标注位于 `images/`、`labels/`，可按需要自行划分数据集。" if flat else
+             "预览仅供抽查；训练使用 `images/`、`labels/` 和 `dataset.yaml`。")
     (folder / "README.md").write_text(
         f"# 数据集可视化预览\n\n从本次导出的 {len(records)} 张图片中选择 {len(samples)} 张，"
-        "优先覆盖训练/验证集、类别、相机视角及无目标样本，其余名额分散选取。\n\n"
+        f"优先覆盖{coverage}，其余名额分散选取。\n\n"
         f"框根据本数据集实际的 `labels/` 文件绘制，格式为 **{box_format.upper()}**。"
-        "预览仅供抽查；训练使用 `images/`、`labels/` 和 `dataset.yaml`。\n\n"
+        f"{usage}\n\n"
         "先打开 [overview.jpg](overview.jpg) 查看总览，再打开单张样例查看细节。\n\n"
         f"## 类别\n\n{class_lines}\n\n"
-        "## 样例来源\n\n| 可视化样例 | 划分 | 原图 | 标签 |\n| --- | --- | --- | --- |\n"
+        "## 样例来源\n\n| 可视化样例 | 来源 | 原图 | 标签 |\n| --- | --- | --- | --- |\n"
         + "\n".join(lines) + "\n", encoding="utf-8")
     return len(samples)

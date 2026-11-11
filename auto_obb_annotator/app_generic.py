@@ -1019,13 +1019,16 @@ class GenericAnnotatorApp(QMainWindow):
     def show_record(self, name):
         record = self.records.get(name)
         if record is None:
-            return
+            return False
         display_record = sync_candidates(record)
         self.current_name = name
-        image = cv2.imread(str(self.active_source / name))
+        path = self.active_source / name
+        image = cv2.imread(str(path)) if path.is_file() else None
         if image is None:
-            self.preview.setText("无法读取图片")
-            return
+            self.clear_preview()
+            self.preview.setText(f"无法读取图片：\n{path}")
+            self.preview_title.setText(f"{name}  |  图片不存在或无法解码")
+            return False
         if isinstance(self.roi, dict):
             cx, cy, radius = circle_pixels(self.roi, image.shape[1], image.shape[0])
             cv2.circle(image, (round(cx), round(cy)), round(radius), (30, 30, 230), 2)
@@ -1070,6 +1073,7 @@ class GenericAnnotatorApp(QMainWindow):
             f"已选 {len(record.get('objects', []))} / 候选 {len(display_record['candidates'])}  |  "
             f"{record.get('reason', '')}"
         )
+        return True
 
     def preview_clicked(self, position):
         if self.current_name is None or self.preview_pixmap is None:

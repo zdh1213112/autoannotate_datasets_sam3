@@ -9,14 +9,17 @@ import os
 from pathlib import Path
 import random
 import shutil
+import tempfile
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from .dataset_preview import write_dataset_previews
 from .generic_region import (
     crop_region, polygon_in_region, region_bounds, region_near_edge,
 )
+from .barcode_core import image_files
 
 
 AUTO_SCORE = 0.50
@@ -357,21 +360,68 @@ def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
                 and (allowed_names is None or record["name"] in allowed_names)]
     if len(selected) < 2:
         raise ValueError("至少需要 2 张可导出的图片，才能建立训练集和验证集")
+    return _write_yolo_export(source_dir, output_dir, selected, classes, box_format, split=True)
+
+
+def export_current_annotations(source_dir: Path, output_dir: Path, records: dict[str, dict],
+                               classes: list[dict], box_format: str, *,
+                               progress=None, should_continue=None) -> tuple[Path, int, int]:
+    """Export every existing image and its current objects, without review states or splits."""
+    classes = validate_classes(classes)
+    selected = [{**records.get(path.name, {}), "name": path.name}
+                for path in image_files(source_dir)]
+    if not selected:
+        raise ValueError("当前目录没有可导出的图片")
+    return _write_yolo_export(source_dir, output_dir, selected, classes, box_format,
+                              split=False, progress=progress, should_continue=should_continue)
+
+
+def _export_progress(progress, should_continue, done, total, stage):
+    if should_continue is not None and not should_continue():
+        raise InterruptedError("已取消导出")
+    if progress is not None:
+        progress(done, total, stage)
+
+
+def _write_yolo_export(source_dir, output_dir, selected, classes, box_format, *, split,
+                       progress=None, should_continue=None):
+    if box_format not in {"hbb", "obb"}:
+        raise ValueError(f"未知标签格式: {box_format}")
     selected.sort(key=lambda item: (hashlib.sha256(item["name"].encode()).hexdigest(),
                                     item["name"]))
-    val_count = min(len(selected) - 1, max(1, round(len(selected) * 0.2)))
+    val_count = min(len(selected) - 1, max(1, round(len(selected) * 0.2))) if split else 0
     val_names = {record["name"] for record in selected[:val_count]}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = output_dir / f"yolo_{box_format}_{stamp}"
+    prefix = f"yolo_{box_format}" if split else f"yolo_all_{box_format}"
+    target = output_dir / f"{prefix}_{stamp}"
     suffix = 2
     while target.exists():
-        target = output_dir / f"yolo_{box_format}_{stamp}_{suffix}"
+        target = output_dir / f"{prefix}_{stamp}_{suffix}"
         suffix += 1
-    target.mkdir(parents=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Publish only a completed dataset. A cancelled/failed export never leaves
+    # a normal-looking output directory containing only part of the labels.
+    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}_", suffix=".partial", dir=output_dir))
+    try:
+        images, objects = _write_yolo_contents(
+            source_dir, temporary, selected, classes, box_format, split=split,
+            val_names=val_names, progress=progress, should_continue=should_continue)
+        _export_progress(progress, should_continue, 1, 1, "完成导出")
+        temporary.rename(target)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return target, images, objects
+
+
+def _write_yolo_contents(source_dir, target, selected, classes, box_format, *, split,
+                         val_names, progress=None, should_continue=None):
     seen_stems = set()
     annotated_images = 0
     object_count = 0
-    for record in sorted(selected, key=lambda item: item["name"]):
+    _export_progress(progress, should_continue, 0, len(selected), "保存图片与标签")
+    for done, record in enumerate(sorted(selected, key=lambda item: item["name"]), 1):
+        _export_progress(None, should_continue, done - 1, len(selected), "保存图片与标签")
         name = record["name"]
         source = source_dir / name
         if Path(name).name != name or not source.is_file():
@@ -380,7 +430,7 @@ def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
         if stem in seen_stems:
             raise ValueError(f"不同扩展名的图片共用文件名: {stem}")
         seen_stems.add(stem)
-        subset = "val" if name in val_names else "train"
+        subset = ("val" if name in val_names else "train") if split else ""
         image_dir = target / "images" / subset
         label_dir = target / "labels" / subset
         image_dir.mkdir(parents=True, exist_ok=True)
@@ -392,10 +442,13 @@ def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
             shutil.copy2(source, destination)
         objects = record.get("objects", [])
         if objects:
-            image = cv2.imread(str(source))
-            if image is None:
-                raise ValueError(f"无法读取图片: {source}")
-            height, width = image.shape[:2]
+            # Coordinates only need the file's actual dimensions. Reading the
+            # image header avoids decoding thousands of full-resolution frames.
+            with Image.open(source) as image:
+                width, height = image.size
+                # Match cv2.imread's default handling of rotated JPEGs.
+                if image.getexif().get(274) in {5, 6, 7, 8}:
+                    width, height = height, width
             label = "".join(yolo_row(obj, width, height, box_format, len(classes))
                             for obj in objects)
             annotated_images += 1
@@ -403,13 +456,29 @@ def export_generic(source_dir: Path, output_dir: Path, records: dict[str, dict],
         else:
             label = ""
         (label_dir / f"{stem}.txt").write_text(label, encoding="utf-8")
+        _export_progress(progress, should_continue, done, len(selected), "保存图片与标签")
     names_yaml = "\n".join(
         f"  {index}: {json.dumps(spec['name'], ensure_ascii=False)}"
         for index, spec in enumerate(classes))
     (target / "dataset.yaml").write_text(
-        "path: .\ntrain: images/train\nval: images/val\n"
+        "path: .\n" + ("train: images/train\nval: images/val\n" if split else "") +
         f"nc: {len(classes)}\nnames:\n{names_yaml}\n",
         encoding="utf-8",
     )
-    write_dataset_previews(target, selected, classes, box_format, val_names)
-    return target, annotated_images, object_count
+    preview_count = write_dataset_previews(target, selected, classes, box_format,
+        val_names if split else None, should_continue=should_continue,
+        progress=lambda done, total: _export_progress(
+            progress, should_continue, done, total, "生成可视化预览"))
+    if not split:
+        (target / "classes.txt").write_text(
+            "\n".join(spec["name"] for spec in classes) + "\n", encoding="utf-8")
+        (target / "README.md").write_text(
+            f"# 当前标注导出\n\n图片 {len(selected)} 张，有框图片 {annotated_images} 张，"
+            f"共 {object_count} 个框；标签格式为 {box_format.upper()}。\n\n"
+            "- `images/`：当前图片目录中的全部图片。\n"
+            "- `labels/`：按同名图片保存当前已选框及类别，无框图片对应空标签文件。\n"
+            "- `classes.txt`、`dataset.yaml`：类别名称及编号。\n"
+            f"- `visualizations/`：{preview_count} 张标注样例及总览图。\n\n"
+            "此导出未划分训练集和验证集，dataset.yaml 未设置 train/val 路径。"
+            "使用前可按需要自行划分。\n", encoding="utf-8")
+    return annotated_images, object_count

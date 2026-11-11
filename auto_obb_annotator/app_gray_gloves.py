@@ -28,7 +28,7 @@ from .app_generic import (
 )
 from .barcode_core import image_files, load_records
 from .generic_core import (
-    detect_generic, normalize_review_reasons, normalize_review_score,
+    detect_generic, export_current_annotations, normalize_review_reasons, normalize_review_score,
     normalize_sample_percent, normalize_sample_seed, normalize_selection_rule,
     sample_image_files, validate_classes,
 )
@@ -348,6 +348,50 @@ class GrayGloveThread(GenericThread):
                 raw_reader.close()
 
 
+class DatasetExportThread(QThread):
+    """Export a snapshot of the current boxes without blocking Qt's event loop."""
+
+    progress_signal = pyqtSignal(int, int, str)
+
+    def __init__(self, source, output, records, classes, box_format):
+        super().__init__()
+        self.source, self.output = source, output
+        # Unselected proposals are unnecessary for exporting or previewing.
+        self.records = {
+            name: copy.deepcopy({key: record[key] for key in ("name", "objects", "camera_id")
+                                 if key in record}) for name, record in records.items()
+        }
+        self.classes = copy.deepcopy(classes)
+        self.box_format = box_format
+        self.running = True
+        self.result = None
+        self.error = None
+        self.cancelled = False
+        self._last_progress = (None, 0.0)
+
+    def stop(self):
+        self.running = False
+
+    def report_progress(self, done, total, stage):
+        last_stage, last_time = self._last_progress
+        now = time.monotonic()
+        if stage != last_stage or done in {0, total} or now - last_time >= 0.1:
+            self.progress_signal.emit(done, total, stage)
+            self._last_progress = (stage, now)
+
+    def run(self):
+        try:
+            target, images, objects = export_current_annotations(
+                self.source, self.output, self.records, self.classes, self.box_format,
+                progress=self.report_progress, should_continue=lambda: self.running)
+            total = sum(1 for _ in (target / "images").iterdir())
+            self.result = (target, images, objects, total)
+        except InterruptedError:
+            self.cancelled = True
+        except Exception as exc:
+            self.error = str(exc)
+
+
 class VideoFrameThread(QThread):
     progress_signal = pyqtSignal(int, int)
     complete_signal = pyqtSignal(str, int, int, str)
@@ -401,6 +445,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
     def __init__(self):
         self._building_gray = True
         self.video_thread = None
+        self.export_thread = None
+        self._close_after_export = False
         self._detect_after_video_import = False
         self._video_import_succeeded = False
         self._loaded_video_folder = None
@@ -420,11 +466,21 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self.recheck_review_button.setToolTip(
             "使用当前设置重新检测所有待人工复核图片，保留其他状态和全部列表。")
         self.recheck_review_button.clicked.connect(self.recheck_review_images)
+        self.export_all_button = QPushButton("导出全部数据集 [Ctrl+Shift+E]")
+        self.export_all_button.setToolTip(
+            "导出当前目录全部图片及此刻已选框，不按复核状态筛选，不划分 train/val；无框生成空标签。")
+        self.export_all_button.clicked.connect(self.export_all_dataset)
+        self.export_all_shortcut = QShortcut(QKeySequence("Ctrl+Shift+E"), self)
+        self.export_all_shortcut.setContext(Qt.WindowShortcut)
+        self.export_all_shortcut.setAutoRepeat(False)
+        self.export_all_shortcut.activated.connect(self.export_all_button.click)
         for index in range(outer.count()):
             controls = outer.itemAt(index).layout()
             if controls is not None and controls.indexOf(self.start_button) >= 0:
                 controls.insertWidget(controls.indexOf(self.start_button) + 1,
                                       self.recheck_review_button)
+                controls.insertWidget(controls.indexOf(self.export_button) + 1,
+                                      self.export_all_button)
                 break
         self.setWindowTitle("灰色手套 · 视频抽帧 / SAM3 标注 / 人工复核")
         self.output_edit.setText(str(DEFAULT_OUTPUT))
@@ -946,7 +1002,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         super().apply_sampling(files, [*sampled, *manual], percent)
 
     def set_config_controls(self, enabled):
+        enabled = enabled and self.export_thread is None
         super().set_config_controls(enabled)
+        if hasattr(self, "export_all_button"):
+            available = enabled and not (self.video_thread and self.video_thread.isRunning())
+            self.export_all_button.setEnabled(available)
         if hasattr(self, "open_project_button"):
             available = enabled and not (self.video_thread and self.video_thread.isRunning())
             self.open_project_button.setEnabled(available)
@@ -1023,7 +1083,25 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         self._visible_rows = visible
         self.visible_count.setText(f"显示 {visible}/{len(self.row_for_name)} 张")
 
+    def record_image_available(self, name):
+        return (self.active_source is None or
+                (Path(name).name == name and (self.active_source / name).is_file()))
+
     def update_table(self, record):
+        # review.jsonl is a history log. Missing source images must not become
+        # phantom rows, but their saved annotations remain available on disk.
+        if not self.record_image_available(record["name"]):
+            row = self.row_for_name.pop(record["name"], None)
+            if row is not None:
+                was_blocked = self.table.blockSignals(True)
+                try:
+                    self.table.removeRow(row)
+                    self.row_for_name = {name: index - int(index > row)
+                                         for name, index in self.row_for_name.items()}
+                finally:
+                    self.table.blockSignals(was_blocked)
+                self.apply_filter()
+            return
         tracked = hasattr(self, "search_edit")
         old_row = self.row_for_name.get(record["name"])
         was_visible = (tracked and old_row is not None and
@@ -1045,16 +1123,22 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             return super().update_counts()
         counts = {status: 0 for status in
                   ("auto", "review", "confirmed", "empty_confirmed", "unlabeled", "skipped")}
-        for record in self.records.values():
+        current_records = [self.records[name] for name in self.row_for_name if name in self.records]
+        for record in current_records:
             status = record.get("status")
             counts[status] = counts.get(status, 0) + 1
         self.summary.setText(
-            f"图片 {len(self.records)} 张  ·  待复核 {counts['review']}  ·  待重检 {counts['unlabeled']}"
+            f"图片 {len(current_records)} 张  ·  待复核 {counts['review']}  ·  待重检 {counts['unlabeled']}"
             f"  ·  已确认 {counts['confirmed']}  ·  无目标 {counts['empty_confirmed']}"
             f"  ·  自动候选 {counts['auto']}  ·  未抽中 {counts['skipped']}")
+        missing = len(self.records) - len(current_records)
+        if missing:
+            self.summary.setText(self.summary.text() + f"  ·  已隐藏 {missing} 条缺失图片记录（历史标签保留）")
 
     def recheck_review_images(self):
         """Reprocess only saved review records without resetting other statuses."""
+        if self.export_thread is not None:
+            return
         if ((self.thread is not None and self.thread.isRunning()) or
                 (self.video_thread is not None and self.video_thread.isRunning())):
             self.status.setText("请先停止当前任务，再重检待复核图片。")
@@ -1136,6 +1220,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         super().receive_result(record)
 
     def start_detection(self):
+        if self.export_thread is not None:
+            return
         if self.video_thread is not None and self.video_thread.isRunning():
             self.status.setText("抽帧完成后才能开始自动检测。")
             return
@@ -1231,7 +1317,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         return super().display_class_name(class_id, record, selected)
 
     def show_record(self, name):
-        super().show_record(name)
+        if not super().show_record(name):
+            return False
         record = self.records.get(name)
         if record and record.get("camera_id"):
             self.preview_title.setText(
@@ -1239,6 +1326,7 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         if record and record.get("side_pending") and record.get("objects"):
             self.preview_title.setText(
                 self.preview_title.text() + "  |  左右未确认：按 Alt+1 / Alt+2")
+        return True
 
     def save_review(self, record):
         """Keep unresolved single-hand frames out of the exported dataset."""
@@ -1335,7 +1423,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.resize(1500, 950)
 
     def export(self):
+        if self.export_thread is not None:
+            return
         for record in self.records.values():
+            if not self.record_image_available(record["name"]):
+                continue
             if record.get("status") not in {"auto", "confirmed"}:
                 continue
             objects = record.get("objects", [])
@@ -1347,6 +1439,88 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
                     self, "导出前需复核", f"{record['name']} 的左右类别未确认或重复。")
                 return
         super().export()
+
+    def export_all_dataset(self):
+        """Save the current objects without rechecking, relabeling or inference."""
+        if self.export_thread is not None:
+            return
+        if ((self.thread is not None and self.thread.isRunning()) or
+                (self.video_thread is not None and self.video_thread.isRunning())):
+            self.status.setText("请先停止抽帧或检测，再导出当前标注。")
+            return
+        try:
+            if self.active_source is None or self.active_output is None or self.active_config is None:
+                raise ValueError("请先载入已有标注项目或完成一次检测。")
+            if self.source_dir() != self.active_source.resolve() or self.output_dir() != self.active_output:
+                raise ValueError("图片或结果目录已更改，请先载入对应项目再导出。")
+            worker = DatasetExportThread(
+                self.active_source, self.active_output, self.records,
+                self.active_config["classes"], self.format_combo.currentData())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.export_thread = worker
+        self._export_control_states = [
+            (widget, widget.isEnabled()) for widget in
+            (self.start_button, self.export_button, self.output_edit,
+             self.path_buttons[1], self.format_combo)
+        ]
+        self._export_previous_stop_text = self.stop_button.text()
+        for widget, _ in self._export_control_states:
+            widget.setEnabled(False)
+        self.set_config_controls(False)
+        self.stop_button.setText("取消导出 [Esc]")
+        self.stop_button.setEnabled(True)
+        self.progress.setRange(0, 0)
+        self.progress_detail.setText("正在准备导出当前标注...")
+        self.status.setText("后台导出中，可取消；使用点击导出时的标注框。")
+        worker.progress_signal.connect(self.export_progress)
+        worker.finished.connect(self.export_finished)
+        worker.start()
+
+    def export_progress(self, done, total, stage):
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(done)
+        self.progress_detail.setText(f"{stage}：{done}/{total}")
+
+    def export_finished(self):
+        worker = self.export_thread
+        if worker is None:
+            return
+        self.export_thread = None
+        self.stop_button.setText(self._export_previous_stop_text)
+        self.stop_button.setEnabled(False)
+        self.set_config_controls(True)
+        for widget, enabled in self._export_control_states:
+            widget.setEnabled(enabled)
+        worker.deleteLater()
+        if self._close_after_export:
+            self._close_after_export = False
+            self.close()
+            return
+        if worker.cancelled:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.progress_detail.setText("导出已取消")
+            self.status.setText("已取消导出并清理未完成文件，原项目和已有导出保持不变。")
+            return
+        if worker.error is not None:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.progress_detail.setText("导出失败")
+            self.status.setText(f"导出失败：{worker.error}")
+            QMessageBox.warning(self, "导出失败", worker.error)
+            return
+        target, images, objects, total = worker.result
+        self.progress.setRange(0, total)
+        self.progress.setValue(total)
+        self.progress_detail.setText(f"导出完成：{total}/{total} 张")
+        self.status.setText(f"已导出当前标注：{total} 张图片、{objects} 个框；未划分数据集。目录：{target}")
+        QMessageBox.information(
+            self, "全部数据集导出完成",
+            f"目录：{target}\n图片：{total} 张，有框：{images} 张，标注框：{objects} 个"
+            f"\nimages/ 与 labels/ 已按当前标注保存，未划分 train/val。"
+            f"\n可视化预览：{target / 'visualizations'}")
 
     def open_large_preview(self):
         if self.current_name is None or self.preview_pixmap is None:
@@ -1506,6 +1680,8 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         return bool(supported) and all(supported)
 
     def import_video(self, detect_after: bool = False):
+        if self.export_thread is not None:
+            return
         if self.thread is not None and self.thread.isRunning():
             self.status.setText("请先停止自动检测，再切换视频。")
             return
@@ -1593,6 +1769,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
             self.start_detection()
 
     def stop_detection(self):
+        if self.export_thread is not None:
+            self.export_thread.stop()
+            self.stop_button.setEnabled(False)
+            self.status.setText("正在取消导出并清理未完成文件...")
+            return
         if self.video_thread is not None and self.video_thread.isRunning():
             self.video_thread.stop()
             self.video_progress.setText("正在停止抽帧...")
@@ -1600,6 +1781,11 @@ class GrayGloveAnnotatorApp(GenericAnnotatorApp):
         super().stop_detection()
 
     def closeEvent(self, event):
+        if self.export_thread is not None:
+            self._close_after_export = True
+            self.stop_detection()
+            event.ignore()
+            return
         if self.video_thread is not None and self.video_thread.isRunning():
             self.video_thread.stop()
             self.video_thread.wait()

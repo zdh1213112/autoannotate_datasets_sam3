@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -13,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import yaml
-from PyQt5.QtCore import QCoreApplication, QEvent, QLibraryInfo, Qt
+from PyQt5.QtCore import QCoreApplication, QEvent, QLibraryInfo, Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication, QScrollArea
@@ -320,6 +321,14 @@ class GrayGloveUITests(unittest.TestCase):
         self.qt.processEvents()
         self.assertIsNone(self.window.video_thread)
 
+    def finish_export(self):
+        deadline = time.monotonic() + 10
+        while self.window.export_thread is not None and time.monotonic() < deadline:
+            self.qt.processEvents()
+            time.sleep(0.01)
+        self.qt.processEvents()
+        self.assertIsNone(self.window.export_thread)
+
     def test_ordinary_button_loads_corrected_preview_and_preserves_raw_for_sam(self):
         video = self.make_orbbec_input()
         self.window.add_video_paths([video])
@@ -448,6 +457,78 @@ class GrayGloveUITests(unittest.TestCase):
         self.assertEqual(self.window.visible_count.text(), "显示 3/3 张")
         self.assertEqual((self.output / "review.jsonl").read_bytes(), before)
         self.assertIsNone(self.window.thread)
+
+    def test_missing_image_history_is_hidden_without_deleting_labels(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("current.jpg", "empty.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        objects = [{"class_id": 0, "score": 0.9,
+                    "polygon": [[20, 50], [50, 50], [50, 90], [20, 90]]}]
+        records = {
+            "current.jpg": {"name": "current.jpg", "status": "confirmed", "objects": objects},
+            "empty.jpg": {"name": "empty.jpg", "status": "empty_confirmed", "objects": []},
+            "old.jpg": {"name": "old.jpg", "status": "confirmed", "objects": objects,
+                        "side_pending": True},
+            "old_empty.jpg": {"name": "old_empty.jpg", "status": "empty_confirmed", "objects": []},
+            "old_auto.jpg": {"name": "old_auto.jpg", "status": "auto", "objects": objects},
+        }
+        review = self.output / "review.jsonl"
+        for record in records.values():
+            append_record(review, record)
+        before = review.read_bytes()
+        self.window.load_project()
+        self.assertEqual(set(self.window.row_for_name), {"current.jpg", "empty.jpg"})
+        self.assertEqual(self.window.table.rowCount(), 2)
+        self.assertEqual(self.window.visible_count.text(), "显示 2/2 张")
+        self.assertIn("图片 2 张", self.window.summary.text())
+        self.assertIn("已隐藏 3 条缺失图片记录", self.window.summary.text())
+        self.assertEqual(self.window.records, records)
+        self.assertEqual(review.read_bytes(), before)
+        # An unresolved historical label must not block export of current images.
+        with patch.object(ui.QMessageBox, "information"), \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.export()
+        warning.assert_not_called()
+        dataset = next(self.output.glob("yolo_hbb_*"))
+        self.assertEqual({path.name for path in (dataset / "images").rglob("*.jpg")},
+                         {"current.jpg", "empty.jpg"})
+        self.assertEqual(review.read_bytes(), before)
+        # Restoring the original image makes its retained annotation visible again.
+        cv2.imwrite(str(source / "old.jpg"), np.zeros((100, 200, 3), np.uint8))
+        self.window.load_project()
+        self.assertIn("old.jpg", self.window.row_for_name)
+        self.assertEqual(self.window.records["old.jpg"], records["old.jpg"])
+
+    def test_failed_preview_clears_objects_pixmap_and_repeated_camera_suffixes(self):
+        source = self.root / "images"
+        source.mkdir()
+        image = source / "one.jpg"
+        cv2.imwrite(str(image), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        record = {"name": image.name, "status": "confirmed", "camera_id": "cam_1",
+                  "objects": [{"class_id": 0, "score": 0.9,
+                               "polygon": [[20, 50], [50, 50], [50, 90], [20, 90]]}]}
+        self.window.records[image.name] = record
+        self.window.update_table(record)
+        self.assertTrue(self.window.show_record(image.name))
+        self.assertIsNotNone(self.window.preview_pixmap)
+        self.assertEqual(self.window.object_table.rowCount(), 1)
+        image.unlink()
+        for _ in range(3):
+            self.assertFalse(self.window.show_record(image.name))
+        self.assertIsNone(self.window.preview_pixmap)
+        self.assertEqual(self.window.object_table.rowCount(), 0)
+        self.assertIn(str(image), self.window.preview.text())
+        self.assertNotIn("cam_1", self.window.preview_title.text())
+        self.window.update_table(record)
+        self.window.update_counts()
+        self.assertEqual(self.window.table.rowCount(), 0)
+        self.assertEqual(self.window.visible_count.text(), "显示 0/0 张")
+        self.assertIn("图片 0 张", self.window.summary.text())
 
     def test_manual_project_open_rejects_missing_source_without_switching(self):
         source = self.root / "images"
@@ -1235,3 +1316,199 @@ class GrayGloveUITests(unittest.TestCase):
         dataset = next(self.output.glob("yolo_hbb_*/dataset.yaml"))
         self.assertIn("nc: 2\nnames:\n  0: \"left\"\n  1: \"right\"",
                       dataset.read_text(encoding="utf-8"))
+
+    def test_export_all_button_saves_current_boxes_without_review_or_inference(self):
+        source = self.root / "images"
+        source.mkdir()
+        for name in ("review.jpg", "pending.jpg", "manual.jpg"):
+            cv2.imwrite(str(source / name), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        objects = [{"class_id": 1, "score": 0.25,
+                    "polygon": [[140, 50], [180, 50], [180, 90], [140, 90]]}]
+        records = {
+            "review.jpg": {"name": "review.jpg", "status": "review", "side_pending": True,
+                            "objects": objects},
+            "pending.jpg": {"name": "pending.jpg", "status": "unlabeled", "objects": []},
+            "manual.jpg": {"name": "manual.jpg", "status": "confirmed", "objects": objects},
+        }
+        for record in records.values():
+            append_record(self.output / "review.jsonl", record)
+        self.window.records = records
+        review_before = (self.output / "review.jsonl").read_bytes()
+        project_before = (self.output / "project.json").read_bytes()
+        # Detection settings do not change the already drawn boxes being saved.
+        self.window.confidence_spin.setValue(0.35)
+        with patch.object(ui.QMessageBox, "information"), \
+                patch.object(ui.QMessageBox, "warning") as warning, \
+                patch.object(ui, "GrayGloveThread", side_effect=AssertionError("must not infer")), \
+                patch.object(self.window, "ensure_project", side_effect=AssertionError("must not reconfigure")):
+            self.window.export_all_button.click()
+            self.finish_export()
+        warning.assert_not_called()
+        target = next(self.output.glob("yolo_all_hbb_*"))
+        self.assertEqual(len(list((target / "images").iterdir())), 3)
+        self.assertTrue((target / "labels" / "review.txt").read_text().startswith("1 "))
+        self.assertEqual((target / "labels" / "pending.txt").read_text(), "")
+        self.assertEqual(list(target.glob("*.json*")), [])
+        self.assertEqual((self.output / "review.jsonl").read_bytes(), review_before)
+        self.assertEqual((self.output / "project.json").read_bytes(), project_before)
+        self.assertEqual(self.window.records["review.jpg"]["status"], "review")
+
+    def test_export_all_disabled_during_detection(self):
+        self.window.set_config_controls(False)
+        self.assertFalse(self.window.export_all_button.isEnabled())
+        self.window.set_config_controls(True)
+        self.assertTrue(self.window.export_all_button.isEnabled())
+        with patch.object(ui, "export_current_annotations") as export:
+            self.window.thread = MagicMock()
+            self.window.thread.isRunning.return_value = True
+            self.window.export_all_dataset()
+            export.assert_not_called()
+        self.window.thread = None
+
+    def prepare_export_project(self):
+        source = self.root / "images"
+        source.mkdir()
+        for index in range(3):
+            cv2.imwrite(str(source / f"{index}.jpg"), np.zeros((100, 200, 3), np.uint8))
+        self.window.input_edit.setText(str(source))
+        self.window.ensure_project()
+        self.window.records = {"0.jpg": {"name": "0.jpg", "objects": [
+            {"class_id": 1, "polygon": [[20, 50], [50, 50], [50, 90], [20, 90]]}],
+            "candidates": [{"selected": False}]}}
+
+    def test_background_export_keeps_ui_responsive_and_uses_click_time_snapshot(self):
+        self.prepare_export_project()
+        entered, release = threading.Event(), threading.Event()
+        thread_ids, ticks = [], []
+        real_export = ui.export_current_annotations
+
+        def slow_export(*args, **kwargs):
+            thread_ids.append(threading.get_ident())
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test export gate timed out")
+            return real_export(*args, **kwargs)
+
+        timer = QTimer(self.window)
+        timer.setInterval(5)
+        timer.timeout.connect(lambda: ticks.append(True))
+        timer.start()
+        try:
+            with patch.object(ui, "export_current_annotations", side_effect=slow_export), \
+                    patch.object(ui.QMessageBox, "information"):
+                self.window.export_all_button.click()
+                deadline = time.monotonic() + 3
+                while (not entered.is_set() or len(ticks) < 3) and time.monotonic() < deadline:
+                    self.qt.processEvents()
+                    time.sleep(0.005)
+                self.assertTrue(entered.is_set())
+                self.assertGreaterEqual(len(ticks), 3)
+                self.assertNotEqual(thread_ids[0], threading.get_ident())
+                self.assertFalse(self.window.export_all_button.isEnabled())
+                self.assertFalse(self.window.start_button.isEnabled())
+                self.assertFalse(self.window.export_button.isEnabled())
+                self.assertTrue(self.window.stop_button.isEnabled())
+                self.assertIn("取消导出", self.window.stop_button.text())
+                worker = self.window.export_thread
+                self.assertNotIn("candidates", worker.records["0.jpg"])
+                self.window.export_all_dataset()  # Ignore a second export request.
+                self.assertIs(self.window.export_thread, worker)
+                self.window.records["0.jpg"]["objects"][0]["class_id"] = 0
+                release.set()
+                self.finish_export()
+        finally:
+            release.set()
+            timer.stop()
+        target = next(self.output.glob("yolo_all_hbb_*"))
+        self.assertTrue((target / "labels" / "0.txt").read_text().startswith("1 "))
+        self.assertTrue(self.window.export_all_button.isEnabled())
+        self.assertTrue(self.window.start_button.isEnabled())
+        self.assertTrue(self.window.export_button.isEnabled())
+        self.assertFalse(self.window.stop_button.isEnabled())
+        self.assertIn("导出完成", self.window.progress_detail.text())
+
+    def test_cancel_export_removes_partial_files_and_keeps_source(self):
+        self.prepare_export_project()
+        entered, release = threading.Event(), threading.Event()
+        real_export = ui.export_current_annotations
+
+        def held_export(*args, **kwargs):
+            report = kwargs["progress"]
+
+            def after_first_image(done, total, stage):
+                report(done, total, stage)
+                if done == 1 and stage == "保存图片与标签":
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test export gate timed out")
+
+            return real_export(*args, **{**kwargs, "progress": after_first_image})
+
+        try:
+            with patch.object(ui, "export_current_annotations", side_effect=held_export), \
+                    patch.object(ui.QMessageBox, "information") as information:
+                self.window.export_all_button.click()
+                deadline = time.monotonic() + 3
+                while not entered.is_set() and time.monotonic() < deadline:
+                    self.qt.processEvents()
+                    time.sleep(0.005)
+                self.assertTrue(entered.is_set())
+                self.assertTrue(list(self.output.glob(".*.partial")))
+                self.window.stop_button.click()
+                release.set()
+                self.finish_export()
+                information.assert_not_called()
+        finally:
+            release.set()
+        self.assertEqual(list(self.output.glob("yolo_all_*")), [])
+        self.assertEqual(list(self.output.glob(".*.partial")), [])
+        self.assertEqual(len(list(self.window.active_source.glob("*.jpg"))), 3)
+        self.assertIn("已取消导出", self.window.status.text())
+        self.assertTrue(self.window.export_all_button.isEnabled())
+
+    def test_background_export_failure_restores_controls(self):
+        self.prepare_export_project()
+        with patch.object(ui, "export_current_annotations", side_effect=OSError("disk full")), \
+                patch.object(ui.QMessageBox, "warning") as warning:
+            self.window.export_all_button.click()
+            self.finish_export()
+        warning.assert_called_once()
+        self.assertIn("disk full", warning.call_args.args[2])
+        self.assertTrue(self.window.export_all_button.isEnabled())
+        self.assertFalse(self.window.stop_button.isEnabled())
+
+    def test_closing_window_cancels_export_without_blocking_the_gui(self):
+        self.prepare_export_project()
+        entered, release = threading.Event(), threading.Event()
+        real_export = ui.export_current_annotations
+
+        def held_export(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test export gate timed out")
+            return real_export(*args, **kwargs)
+
+        try:
+            with patch.object(ui, "export_current_annotations", side_effect=held_export), \
+                    patch.object(ui.QMessageBox, "information") as information:
+                self.window.export_all_button.click()
+                deadline = time.monotonic() + 3
+                while not entered.is_set() and time.monotonic() < deadline:
+                    self.qt.processEvents()
+                    time.sleep(0.005)
+                self.assertTrue(entered.is_set())
+                # close() returns while the worker is still waiting; it must
+                # not wait() on the worker from the main thread.
+                self.assertFalse(self.window.close())
+                self.assertTrue(self.window._close_after_export)
+                self.assertIsNotNone(self.window.export_thread)
+                release.set()
+                self.finish_export()
+                information.assert_not_called()
+        finally:
+            release.set()
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(list(self.output.glob("yolo_all_*")), [])
+        self.assertEqual(list(self.output.glob(".*.partial")), [])

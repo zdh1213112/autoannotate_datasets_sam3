@@ -1,12 +1,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 from auto_obb_annotator.generic_core import (
-    detect_generic, export_generic, has_duplicate_selected_boxes,
+    detect_generic, export_current_annotations, export_generic, has_duplicate_selected_boxes,
     normalize_sample_percent,
     normalize_sample_seed, normalize_selection_rule, sample_image_files,
     recheck_review_scores, select_detections,
@@ -276,6 +277,105 @@ class GenericCoreTests(unittest.TestCase):
                                {"one.png", "three.png"})
             self.assertEqual([line.split()[0] for line in lines], ["0", "1"])
             self.assertIn('1: "瓶子"', (target / "dataset.yaml").read_text())
+
+    def test_export_current_annotations_ignores_status_without_splits_or_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "images"
+            source.mkdir()
+            polygon = [[50, 60], [90, 60], [90, 110], [50, 110]]
+            records = {}
+            for index, status in enumerate(("auto", "review", "unlabeled", "confirmed",
+                                            "empty_confirmed", "skipped")):
+                name = f"{index}.png"
+                cv2.imwrite(str(source / name), self.image)
+                records[name] = {"name": name, "status": status, "side_pending": True,
+                                 "objects": ([{"class_id": index % 2, "score": 0.21,
+                                               "polygon": polygon}] if index < 4 else []),
+                                 "candidates": [{"class_id": 1, "polygon": polygon,
+                                                 "score": 0.99, "selected": False}]}
+            cv2.imwrite(str(source / "unrecorded.png"), self.image)
+            records["missing.png"] = {"name": "missing.png", "status": "confirmed",
+                                       "objects": [{"class_id": 99, "polygon": polygon}]}
+            for box_format, columns in (("hbb", 5), ("obb", 9)):
+                with self.subTest(box_format=box_format):
+                    target, images, objects = export_current_annotations(
+                        source, root, records, CLASSES, box_format)
+                    self.assertEqual((images, objects), (4, 4))
+                    self.assertEqual(len(list((target / "images").iterdir())), 7)
+                    self.assertEqual(len(list((target / "labels").iterdir())), 7)
+                    self.assertFalse((target / "images" / "train").exists())
+                    self.assertFalse((target / "images" / "val").exists())
+                    for index in range(4):
+                        row = (target / "labels" / f"{index}.txt").read_text().splitlines()
+                        self.assertEqual(len(row), 1)  # Only current objects, not candidates.
+                        self.assertEqual(len(row[0].split()), columns)
+                        self.assertEqual(row[0].split()[0], str(index % 2))
+                    for name in ("4", "5", "unrecorded"):
+                        self.assertEqual((target / "labels" / f"{name}.txt").read_text(), "")
+                    yaml = (target / "dataset.yaml").read_text()
+                    self.assertNotIn("\ntrain:", yaml)
+                    self.assertNotIn("\nval:", yaml)
+                    self.assertEqual((target / "classes.txt").read_text(), "cup\n瓶子\n")
+                    self.assertEqual(list(target.glob("*.json*")), [])
+                    self.assertTrue((target / "visualizations" / "overview.jpg").is_file())
+                    self.assertEqual(len(list((target / "visualizations").glob("all__*.jpg"))), 7)
+                    self.assertNotIn("训练/验证集", (target / "visualizations" / "README.md").read_text())
+                    self.assertEqual(records["1.png"]["status"], "review")
+                    self.assertTrue(records["1.png"]["side_pending"])
+
+    def test_export_current_annotations_accepts_one_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            cv2.imwrite(str(source / "one.png"), self.image)
+            target, images, objects = export_current_annotations(source, root, {}, CLASSES, "hbb")
+            self.assertEqual((images, objects), (0, 0))
+            self.assertTrue((target / "images" / "one.png").is_file())
+            self.assertEqual((target / "labels" / "one.txt").read_text(), "")
+
+    def test_cancel_export_during_previews_cleans_up_without_removing_previous_dataset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output = root / "source", root / "output"
+            source.mkdir()
+            output.mkdir()
+            existing = output / "yolo_all_hbb_previous"
+            existing.mkdir()
+            (existing / "keep.txt").write_text("existing export")
+            for index in range(3):
+                cv2.imwrite(str(source / f"{index}.png"), self.image)
+            running = True
+            stages = []
+
+            def progress(done, total, stage):
+                nonlocal running
+                stages.append((done, total, stage))
+                if stage == "生成可视化预览" and done == 1:
+                    running = False
+
+            with self.assertRaises(InterruptedError):
+                export_current_annotations(source, output, {}, CLASSES, "hbb",
+                                           progress=progress, should_continue=lambda: running)
+            self.assertIn((3, 3, "保存图片与标签"), stages)
+            self.assertIn((1, 3, "生成可视化预览"), stages)
+            self.assertEqual(list(output.iterdir()), [existing])
+            self.assertEqual((existing / "keep.txt").read_text(), "existing export")
+            self.assertEqual(len(list(source.iterdir())), 3)
+
+    def test_export_failure_cleans_partial_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output = root / "source", root / "output"
+            source.mkdir()
+            cv2.imwrite(str(source / "one.png"), self.image)
+            with patch("auto_obb_annotator.generic_core.write_dataset_previews",
+                       side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    export_current_annotations(source, output, {}, CLASSES, "hbb")
+            self.assertEqual(list(output.iterdir()), [])
+            self.assertTrue((source / "one.png").is_file())
 
 
 if __name__ == "__main__":
